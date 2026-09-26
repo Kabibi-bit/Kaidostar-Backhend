@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: kaidostar-backend
+    # NOTE: Pro auto-submit drives a real Chromium browser (Playwright). The
+    # native python env below downloads the browser in the build, but Chromium's
+    # OS libraries may be missing on the native runtime - if so, auto-submit
+    # degrades safely to the manual hand-off. For guaranteed auto-submit support,
+    # deploy the Dockerfile instead (it runs `playwright install --with-deps
+    # chromium`): set `env: docker` and remove the buildCommand.
+    env: python
+    buildCommand: "pip install -r requirements.txt && python -m playwright install chromium"
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ADZUNA_APP_ID
+        sync: false
+      - key: ADZUNA_APP_KEY
+        sync: false
+      - key: NCAA_API_BASE
+        sync: false
+      - key: NCAA_API_KEY
+        sync: false
+      - key: ROBOFLOW_MODEL_ID
+        sync: false
+      - key: ROBOFLOW_API_KEY
+        sync: false
+      - key: SCAN_INTERVAL_MINUTES
+        value: "1440"
