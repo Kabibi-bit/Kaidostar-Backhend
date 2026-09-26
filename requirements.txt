@@ -1,0 +1,26 @@
+# Pinned to stable, mutually-compatible versions. Unpinned deps were a real
+# deploy hazard: each build pulled the latest PyPI release, so a breaking change
+# in fastapi/pydantic/sqlalchemy/anthropic could crash a build that worked before.
+# Pydantic v2 + the matching FastAPI are pinned together (the code uses v2
+# field_validator syntax, which needs pydantic>=2 and a FastAPI that supports it).
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+pgvector==0.3.6
+pydantic==2.10.4
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+httpx==0.28.1
+anthropic==0.42.0
+apscheduler==3.11.0
+email-validator==2.2.0
+bcrypt==4.2.1
+PyJWT==2.10.1
+voyageai==0.3.2
+python-docx==1.1.2
+pytest==8.3.4
+# Pro auto-submit drives a real headless browser to fill/submit web application
+# forms. The deploy must also install the browser binary: `playwright install
+# chromium`. If absent, auto-submit degrades safely to the manual hand-off.
+playwright==1.49.1
