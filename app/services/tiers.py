@@ -23,6 +23,7 @@ TIER_FEATURES = {
     "free": {
         "opportunity_watch": True, "roadmap": True, "metis": True, "manual_drafting": True,
         "school_readiness": True,
+        "workshop": False,
         "deep_match_explanations": False,
         "outreach_drafting": False,
         "auto_mode": False,
@@ -33,6 +34,7 @@ TIER_FEATURES = {
     "pro": {
         "opportunity_watch": True, "roadmap": True, "metis": True, "manual_drafting": True,
         "school_readiness": True,
+        "workshop": True,
         "deep_match_explanations": True,
         "outreach_drafting": True,
         "auto_mode": True,
@@ -42,6 +44,7 @@ TIER_FEATURES = {
     },
     "max": {
         "opportunity_watch": True, "roadmap": True, "metis": True, "manual_drafting": True,
+        "workshop": True,
         "school_readiness": True, "deep_match_explanations": True, "outreach_drafting": True,
         "auto_mode": True,
         "auto_submit": True,
