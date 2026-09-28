@@ -9,7 +9,7 @@ from app.services.ai_client import get_client
  
 from app.db import get_db
 from app.models.db_models import Profile, RoadmapSummary
-from app.services.market_research import research_company, generate_interview_prep
+from app.services.market_research import research_company, generate_interview_prep, mock_interview_turn
 from app.services.rate_limit import rate_limit_by_tier
  
 _log = logging.getLogger("kaidostar")
@@ -91,4 +91,41 @@ def interview_prep_route(payload: InterviewPrepIn, db: Session = Depends(get_db)
         _log.warning("Could not generate interview prep just now - %s", e)
         raise HTTPException(status_code=502, detail="Could not generate interview prep just now. Please try again.")
     return prep
+ 
+ 
+class MockInterviewIn(BaseModel):
+    user_id: str
+    role_title: str = Field(max_length=200)
+    company_name: str | None = Field(default=None, max_length=200)
+    question: str | None = Field(default=None, max_length=2000)
+    answer: str | None = Field(default=None, max_length=8000)
+    turn_index: int = Field(default=0, ge=0, le=100)
+ 
+ 
+@router.post("/mock-interview")
+def mock_interview_route(payload: MockInterviewIn, db: Session = Depends(get_db), authorization: str = Header(None)):
+    """One turn of the live AI mock interviewer. Backs the Interview Prep
+    page's practice mode: blank answer -> an opening question; a real answer
+    -> honest, specific feedback plus the natural follow-up question."""
+    client = get_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="AI service is not configured. Please try again later.")
+    import uuid as uuid_module
+    try:
+        uuid_module.UUID(payload.user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="user_id is not a valid UUID")
+    verify_token_belongs_to_user(payload.user_id, authorization)
+    if not (payload.role_title or "").strip():
+        raise HTTPException(status_code=400, detail="role_title is required")
+    rate_limit_by_tier(db, payload.user_id, "mock-interview", per_action_limit=400)
+    try:
+        result = mock_interview_turn(
+            client, payload.role_title, payload.company_name or "",
+            payload.question or "", payload.answer or "", payload.turn_index,
+        )
+    except Exception as e:
+        _log.warning("Could not run the mock interview turn just now - %s", e)
+        raise HTTPException(status_code=502, detail="Could not reach the interviewer just now. Please try again.")
+    return result
  
