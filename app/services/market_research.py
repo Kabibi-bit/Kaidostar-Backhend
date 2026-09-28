@@ -99,6 +99,59 @@ def generate_interview_prep(anthropic_client, company_name: str, role_title: str
     return parsed
  
  
+def mock_interview_turn(anthropic_client, role_title: str, company_name: str, question: str, answer: str, turn_index: int = 0) -> dict:
+    """One turn of a live mock interview. If `answer` is blank this is the
+    opening move, so it just returns a strong first question. Otherwise it
+    evaluates the candidate's real answer - honestly and specifically, never
+    generic praise - and returns the follow-up a real interviewer would ask
+    next, so the practice feels like a genuine back-and-forth.
+    """
+    company_line = f" at \"{company_name}\"" if (company_name or "").strip() else ""
+    if not (answer or "").strip():
+        prompt = (
+            f"You are a realistic, professional interviewer for the role \"{role_title}\"{company_line}. "
+            "Ask the candidate ONE strong opening interview question for this role - the kind a real interviewer "
+            "would actually open with. Return ONLY a JSON object with exactly these keys: "
+            "\"feedback\" (empty string), \"strengths\" (empty array), \"improvements\" (empty array), "
+            "\"follow_up\" (the opening question, one sentence), \"score\" (null). No markdown, no commentary."
+        )
+    else:
+        prompt = (
+            f"You are a realistic but fair interviewer for the role \"{role_title}\"{company_line}. "
+            f"You asked the candidate: \"{question}\".\n\n"
+            f"They answered: \"{answer}\".\n\n"
+            "Evaluate this answer honestly and specifically - reference what they actually said, never generic "
+            "praise or generic criticism. Be encouraging but truthful. Return ONLY a JSON object with exactly "
+            "these keys:\n"
+            "- feedback: 2-3 sentences of specific, honest feedback on THIS answer\n"
+            "- strengths: an array of 1-3 short, specific things the answer did well (empty array if none genuinely stood out)\n"
+            "- improvements: an array of 1-3 short, specific, actionable ways to make it stronger\n"
+            "- follow_up: the single next question a real interviewer would naturally ask from here (one sentence)\n"
+            "- score: an integer 1-5 for the overall strength of this answer\n"
+            "No markdown fences, no commentary."
+        )
+    resp = anthropic_client.messages.create(
+        model="claude-sonnet-4-6", max_tokens=700,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    import json
+    text = "".join((b.text or "") for b in resp.content if b.type == "text").strip()
+    text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        raise ValueError("mock interview response was not valid JSON")
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("follow_up"), str) or not parsed.get("follow_up").strip():
+        raise ValueError(f"mock interview response had an unexpected shape: {parsed}")
+    # Normalize the optional/typed fields so the frontend never has to guard them.
+    parsed["feedback"] = parsed.get("feedback") if isinstance(parsed.get("feedback"), str) else ""
+    parsed["strengths"] = parsed.get("strengths") if isinstance(parsed.get("strengths"), list) else []
+    parsed["improvements"] = parsed.get("improvements") if isinstance(parsed.get("improvements"), list) else []
+    _score = parsed.get("score")
+    parsed["score"] = _score if isinstance(_score, int) and 1 <= _score <= 5 else None
+    return parsed
+ 
+ 
 def research_company_leadership(anthropic_client, company_name: str) -> dict:
     """Searches for a company's real senior leadership - not just the
     CEO, but the CTO, COO, CPO, and other C-suite or VP-level
