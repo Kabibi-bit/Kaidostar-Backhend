@@ -76,7 +76,13 @@ def get_notifications(user_id: str, db: Session = Depends(get_db), _auth: dict =
  
  
 @router.post("/{notification_id}/read")
-def mark_read(notification_id: str, db: Session = Depends(get_db), authorization: str = Header(None)):
+def mark_read(notification_id: str, read: bool = True, db: Session = Depends(get_db), authorization: str = Header(None)):
+    """Marks a single notification read or unread. `read` is an optional
+    query flag defaulting to True, so an existing caller that posts with
+    no query still marks read exactly as before; `?read=false` flips it
+    back to unread. This backs the Inbox's per-item read/unread toggle -
+    the per-item counterpart to mark_all_read below.
+    """
     import uuid as uuid_module
     try:
         uuid_module.UUID(notification_id)
@@ -88,9 +94,9 @@ def mark_read(notification_id: str, db: Session = Depends(get_db), authorization
     # This route only has a notification_id, so verify the token
     # against the notification's real owner before mutating it.
     verify_token_belongs_to_user(str(note.user_id), authorization)
-    note.is_read = True
+    note.is_read = read
     db.commit()
-    return {"status": "marked read"}
+    return {"status": "marked read" if read else "marked unread", "is_read": read}
  
  
 @router.post("/{user_id}/mark-all-read")
@@ -128,6 +134,32 @@ def clear_notifications(user_id: str, db: Session = Depends(get_db), _auth: dict
     deleted = db.query(Notification).filter(Notification.user_id == user_id).delete()
     db.commit()
     return {"status": "cleared", "deleted_count": deleted}
+ 
+ 
+@router.delete("/{user_id}/{notification_id}")
+def delete_notification(user_id: str, notification_id: str, db: Session = Depends(get_db), _auth: dict = Depends(require_auth_for_user)):
+    """Deletes ONE notification the person dismissed from their Inbox -
+    the per-item counterpart to clear_notifications above. The two-segment
+    path is distinct from the bulk DELETE /{user_id}, and the query is
+    scoped to the caller's own rows (user_id in the path is auth-checked),
+    so one person can never delete another's notification even by guessing
+    an id. Returns 404 if no matching row is owned by this user.
+    """
+    import uuid as uuid_module
+    try:
+        uuid_module.UUID(user_id)
+        uuid_module.UUID(notification_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    deleted = (
+        db.query(Notification)
+        .filter(Notification.id == notification_id, Notification.user_id == user_id)
+        .delete()
+    )
+    db.commit()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    return {"status": "deleted", "notification_id": notification_id, "deleted_count": deleted}
  
  
 class NotificationPreferencesIn(BaseModel):
