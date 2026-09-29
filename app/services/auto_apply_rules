@@ -46,11 +46,32 @@ DEFAULT_RULES = {
     "salaryFloor": 0,          # 0 = no floor (in $k)
     "dailyCap": 10,            # 0 = unlimited (fully hands-off)
     "companies": [],           # [{name, rule:'always'|'never'|'boost'}]
+    # Optional targeting add-ons. Each is an include-list: empty means "no
+    # constraint" (the engine applies exactly as it did before these existed),
+    # non-empty means a listing must match at least one entry. All are matched
+    # from real listing data - location text, and the posting's own words -
+    # never from a structured field the listings don't carry, so the live
+    # preview always shows exactly what they do.
+    "locations": [],           # target locations, e.g. ["Remote", "London", "New York"]
+    "industries": [],          # target fields/industries, e.g. ["fintech", "healthcare"]
+    "companySizes": [],        # size buckets: subset of SIZE_SIGNALS keys
 }
  
 # Rule keys that are lists, normalized defensively (mirrors state.js, which
-# coerces these three back to arrays after merging stored settings).
-_LIST_KEYS = ("keywordsInclude", "keywordsExclude", "companies")
+# coerces these back to arrays after merging stored settings).
+_LIST_KEYS = ("keywordsInclude", "keywordsExclude", "companies", "locations", "industries", "companySizes")
+ 
+# Company-size buckets, matched from words the posting itself uses (listings
+# carry no structured size field). Kept byte-for-byte identical to the client
+# so the preview and the engine agree. A posting that never states its size
+# simply won't match any bucket - which is why size is an opt-in add-on, shown
+# live in the preview so a too-narrow choice is obvious immediately.
+SIZE_SIGNALS = {
+    "startup": ["startup", "start-up", "seed", "series a", "series b", "early-stage", "early stage", "pre-seed"],
+    "small": ["small business", "small team", "boutique", "smb"],
+    "midmarket": ["mid-size", "midsize", "mid size", "scale-up", "scaleup", "growth-stage", "growth stage", "mid-market"],
+    "enterprise": ["enterprise", "fortune 500", "publicly traded", "multinational", "global leader", "large organization"],
+}
  
  
 def merge_rules(stored) -> dict:
@@ -223,6 +244,33 @@ def evaluate_match(item: dict, rules: dict, threshold: int) -> dict:
     sal_k = _salary_k(item.get("salary_min"))
     if floor > 0 and sal_k is not None and sal_k < floor:
         blocks.append("Below $%dk" % floor)
+ 
+    # 11. target locations (optional add-on). Non-empty -> the listing's
+    #     location must contain one of them (or be remote, if "remote" is
+    #     listed). Empty -> any location, exactly as before.
+    loc_hay = (item.get("location") or "").lower()
+    is_remote = "remote" in loc_hay
+    locations = [str(l).strip().lower() for l in (rules.get("locations") or []) if str(l).strip()]
+    if locations:
+        def _loc_ok(term):
+            return is_remote if term == "remote" else (term in loc_hay)
+        if not any(_loc_ok(t) for t in locations):
+            blocks.append("Not in your target locations")
+ 
+    # 12. target fields / industries (optional add-on). Matched from the
+    #     posting text, same haystack as keywords.
+    industries = [str(i).strip().lower() for i in (rules.get("industries") or []) if str(i).strip()]
+    if industries and not any(i in hay for i in industries):
+        blocks.append("Not in your target fields")
+ 
+    # 13. company size (optional add-on). Matched from words the posting
+    #     uses; a listing that doesn't state a size matches no bucket.
+    sizes = [str(s).strip().lower() for s in (rules.get("companySizes") or []) if str(s).strip()]
+    if sizes:
+        def _size_ok(bucket):
+            return any(w in hay for w in SIZE_SIGNALS.get(bucket, []))
+        if not any(_size_ok(s) for s in sizes):
+            blocks.append("Company size not indicated as your target")
  
     # boost is a ranking/annotation hint, never an accept/reject reason.
     if _company_match(companies, org, "boost"):
