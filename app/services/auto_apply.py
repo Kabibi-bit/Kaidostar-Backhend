@@ -419,13 +419,26 @@ def create_application_for_match(db, anthropic_client, user_id: str, listing_id:
     user_threshold = profile.auto_apply_threshold if getattr(profile, "auto_apply_threshold", None) else None
     status = decide_auto_send(composite_confidence, threshold=user_threshold)
  
+    # Autonomous apply: a user who has granted explicit, revocable auto-submit consent
+    # has asked the engine to apply for them fully hands-off. For an approved
+    # auto-generated application that means NO undo window - it's sendable immediately,
+    # so the scheduler's unattended auto-send delivers it on the very next tick, without
+    # the person ever opening the app. The 30-minute undo window stays in force for
+    # everyone who has NOT granted that consent (the default), and for anything that
+    # still needs manual review.
+    autonomous = auto_generated and bool(getattr(profile, "auto_submit_consent", False))
+    if status == "approved":
+        sendable_at = utcnow() if autonomous else compute_sendable_at()
+    else:
+        sendable_at = None
+ 
     app_record = Application(
         user_id=user_id,
         listing_id=listing_id,
         draft_content=draft_text,
         confidence_pct=composite_confidence,
         status=status,
-        sendable_at=compute_sendable_at() if status == "approved" else None,
+        sendable_at=sendable_at,
         auto_generated=auto_generated,
         factors_snapshot={**match["factors"], "signal_strength": match["signal_strength"], "factors_engaged": match["factors_engaged"], "data_quality": match.get("data_quality")},
         counterfactual_confidence_pct=counterfactual_confidence,
