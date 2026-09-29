@@ -764,3 +764,71 @@ def draft_leadership_grounded_outreach(db, anthropic_client, user_id: str, listi
         "leaders": [l.get("name") for l in leaders],
     }
  
+ 
+def auto_apply_and_outreach_for_user(db, anthropic_client, user_id, profile, ranked):
+    """The ONE autonomous auto-apply pass, shared by every unattended entry
+    point - the nightly scheduler AND the manual /scan endpoint - so the two
+    can never drift apart again (they used to: the scheduler was taught the
+    acceptance rules while /scan still applied on threshold alone, which post-
+    consent would auto-submit to never-list companies, off types, etc. with no
+    undo window).
+ 
+    Given this user's ranked candidates, it:
+      * loads their own rules (merged over the same defaults the UI uses),
+      * filters to what passes every rule and fits their daily cap
+        (0 = unlimited - their choice, not a forced rail), counting today's
+        auto-applications so a second run in the same day can't exceed it,
+      * drafts + approves each accepted application (create_application_for_match
+        applies mode/consent, so the undo window - or its absence - is decided
+        there), and
+      * drafts outreach for the SAME accepted matches when outreach is on.
+ 
+    Each listing is isolated so one failure can't abort the batch. Returns a
+    summary the caller can log or return to the client.
+    """
+    from app.services.auto_apply_rules import merge_rules, select_matches_to_apply, applications_made_today
+ 
+    rules = merge_rules(getattr(profile, "auto_apply_rules", None))
+    threshold = profile.auto_apply_threshold or DEFAULT_CONFIDENCE_THRESHOLD
+    made_today = applications_made_today(db, user_id)
+    selection = select_matches_to_apply(ranked, rules, threshold, already_today=made_today)
+    mode = rules.get("mode")
+    draft_outreach_on = bool(rules.get("outreach"))
+ 
+    applied = []
+    outreach = []
+    for chosen in selection["to_apply"]:
+        listing = chosen["item"]
+        try:
+            outcome = create_application_for_match(db, anthropic_client, str(user_id), listing["id"], auto_generated=True, mode=mode)
+            if not outcome.get("error") and not outcome.get("already_existed") and outcome.get("status") == "approved":
+                applied.append({
+                    "listing_id": listing["id"],
+                    "title": listing.get("title"),
+                    "confidence": outcome.get("composite_confidence"),
+                    "status": outcome.get("status"),
+                })
+        except Exception:
+            db.rollback()
+ 
+        if draft_outreach_on:
+            try:
+                outreach_result = draft_outreach_for_match(db, anthropic_client, str(user_id), listing["id"], auto_generated=True)
+                if not outreach_result.get("error") and not outreach_result.get("already_existed"):
+                    outreach.append({
+                        "listing_id": listing["id"],
+                        "title": listing.get("title"),
+                        "to_address": outreach_result.get("to_address"),
+                    })
+            except Exception:
+                db.rollback()
+ 
+    return {
+        "applied": applied,
+        "outreach": outreach,
+        "accepted_total": selection["accepted_total"],
+        "filtered_count": len(selection["filtered"]),
+        "capped_out": selection["capped_out"],
+        "ranked_count": len(ranked),
+    }
+ 
