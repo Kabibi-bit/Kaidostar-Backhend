@@ -75,6 +75,7 @@ class Profile(Base):
     is_current = Column(Boolean, default=True)
     auto_apply_enabled = Column(Boolean, nullable=False, default=False)
     auto_apply_threshold = Column(Integer, nullable=False, default=80)
+    auto_apply_rules = Column(JSONB, nullable=True)  # the Auto acceptance rules: types, locations, deadline window, keyword include/exclude, per-company rules, signal filters, salary floor, daily cap, mode (auto-approve vs draft-only), outreach on/off. Read by the scan to decide what to act on.
     notification_preferences = Column(JSONB, default=lambda: {"scan": True, "auto_apply": True, "outreach_sent": True, "applications_approved": True})
     created_at = Column(DateTime, default=datetime.utcnow)
  
