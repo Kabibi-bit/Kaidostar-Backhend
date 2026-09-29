@@ -308,7 +308,37 @@ def compute_sendable_at() -> datetime:
     return utcnow() + timedelta(minutes=UNDO_WINDOW_MINUTES)
  
  
-def create_application_for_match(db, anthropic_client, user_id: str, listing_id: str, auto_generated: bool = False):
+def effective_status(status: str, mode: str | None, autonomous: bool) -> str:
+    """'draft_only' mode holds an otherwise-approved auto-application as
+    pending_review so the user approves it before anything happens.
+    Autonomous consent overrides that: consenting to hands-off application
+    IS a request to approve and send without the manual step. Pure so the
+    policy is unit-testable on its own.
+    """
+    if mode == "draft_only" and not autonomous and status == "approved":
+        return "pending_review"
+    return status
+ 
+ 
+def decide_sendable_at(status: str, autonomous: bool):
+    """When an application becomes deliverable by the scheduler.
+ 
+    - Not approved (still needs review): never auto-sends -> None.
+    - Approved + autonomous consent: the user has explicitly, revocably
+      asked the engine to apply for them fully hands-off, so there is NO
+      undo window - it's sendable immediately and the scheduler delivers
+      it on its very next tick, without the person opening the app.
+    - Approved, no consent (the default): the 30-minute undo window still
+      applies, exactly as before.
+ 
+    Pure and side-effect free so the policy is unit-testable on its own.
+    """
+    if status != "approved":
+        return None
+    return utcnow() if autonomous else compute_sendable_at()
+ 
+ 
+def create_application_for_match(db, anthropic_client, user_id: str, listing_id: str, auto_generated: bool = False, mode: str | None = None):
     """The actual 'accept a match -> draft an application' pipeline,
     shared by the explicit /applications/accept endpoint, the automatic
     trigger when a user stars a listing, and the fully-autonomous Auto
@@ -419,18 +449,16 @@ def create_application_for_match(db, anthropic_client, user_id: str, listing_id:
     user_threshold = profile.auto_apply_threshold if getattr(profile, "auto_apply_threshold", None) else None
     status = decide_auto_send(composite_confidence, threshold=user_threshold)
  
-    # Autonomous apply: a user who has granted explicit, revocable auto-submit consent
-    # has asked the engine to apply for them fully hands-off. For an approved
-    # auto-generated application that means NO undo window - it's sendable immediately,
-    # so the scheduler's unattended auto-send delivers it on the very next tick, without
-    # the person ever opening the app. The 30-minute undo window stays in force for
-    # everyone who has NOT granted that consent (the default), and for anything that
-    # still needs manual review.
+    # Autonomous apply: a user who has granted explicit, revocable auto-submit
+    # consent has asked the engine to apply for them fully hands-off.
     autonomous = auto_generated and bool(getattr(profile, "auto_submit_consent", False))
-    if status == "approved":
-        sendable_at = utcnow() if autonomous else compute_sendable_at()
-    else:
-        sendable_at = None
+ 
+    # 'draft_only' mode holds an otherwise-approved match for manual review;
+    # autonomous consent overrides it. Both the mode decision and the undo
+    # window are single pure policy functions, so they're testable on their
+    # own and can't drift from what the scan and the tests assume.
+    status = effective_status(status, mode, autonomous)
+    sendable_at = decide_sendable_at(status, autonomous)
  
     app_record = Application(
         user_id=user_id,
