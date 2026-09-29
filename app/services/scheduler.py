@@ -476,7 +476,7 @@ def run_scan_for_all_users():
     autonomous mode actually autonomous, not just a bigger manual
     button: it fires even if nobody opens the app that day.
     """
-    from app.services.auto_apply import create_application_for_match, draft_outreach_for_match
+    from app.services.auto_apply import auto_apply_and_outreach_for_user
  
     anthropic_client = get_client()  # None if no API key; auto-apply/outreach are wrapped per-listing
     db = SessionLocal()
@@ -549,60 +549,24 @@ def run_scan_for_all_users():
                 if profile and profile.auto_apply_enabled:
                     listings = all_listings_this_cycle
                     from app.models.db_models import DismissedListing
-                    from app.services.auto_apply import DEFAULT_CONFIDENCE_THRESHOLD
-                    from app.services.auto_apply_rules import merge_rules, select_matches_to_apply, applications_made_today
                     dismissed_ids = {str(row.listing_id) for row in db.query(DismissedListing).filter(DismissedListing.user_id == user.id).all()}
                     ranked = rank_listings([_listing_to_dict(l) for l in listings], _profile_to_dict(profile), top_n=10, dismissed_ids=dismissed_ids)
  
-                    # The user's OWN acceptance rules (company always/never/boost,
-                    # type, keywords, signal strength, ghost risk, salary floor,
-                    # deadline window, remote-only) now decide what the unattended
-                    # engine may touch - the SAME logic the Auto page previews, so
-                    # "what you see" equals "what it actually does". Essential once
-                    # autonomous consent removes the undo window: the engine submits
-                    # exactly the set the preview promised, nothing else. The daily
-                    # cap is the user's choice (0 = unlimited, fully hands-off), not a
-                    # forced rail, and counts today's auto-applications so a second
-                    # scan in the same day can't blow past it.
-                    rules = merge_rules(getattr(profile, "auto_apply_rules", None))
-                    threshold = profile.auto_apply_threshold or DEFAULT_CONFIDENCE_THRESHOLD
-                    made_today = applications_made_today(db, user.id)
-                    selection = select_matches_to_apply(ranked, rules, threshold, already_today=made_today)
-                    mode = rules.get("mode")
-                    draft_outreach_on = bool(rules.get("outreach"))
-                    auto_count = 0
-                    outreach_count = 0
-                    for chosen in selection["to_apply"]:
-                        listing = chosen["item"]
-                        # Isolate each listing: a failure on ONE listing (e.g. a DB
-                        # constraint on its application row) must not skip the
-                        # remaining listings for this user - the outer per-user
-                        # try/except alone would abort the whole loop, losing every
-                        # subsequent auto-application. Per-listing isolation matches
-                        # this file's "one failure shouldn't cancel everything" design.
-                        try:
-                            outcome = create_application_for_match(db, anthropic_client, str(user.id), listing["id"], auto_generated=True, mode=mode)
-                            if not outcome.get("error") and not outcome.get("already_existed") and outcome.get("status") == "approved":
-                                auto_count += 1
-                        except Exception as _app_err:
-                            db.rollback()
-                            print(f"    Skipped auto-apply for listing {listing.get('id')}: {_app_err}")
- 
-                        # Outreach is drafted only for matches that passed the same
-                        # rules (never for a never-apply company or an off type) and
-                        # only when the user left outreach on. Still just a draft -
-                        # status stays 'drafted' until the user explicitly sends it.
-                        if draft_outreach_on:
-                            try:
-                                outreach_result = draft_outreach_for_match(db, anthropic_client, str(user.id), listing["id"], auto_generated=True)
-                                if not outreach_result.get("error") and not outreach_result.get("already_existed"):
-                                    outreach_count += 1
-                            except Exception as _out_err:
-                                db.rollback()
-                                print(f"    Skipped auto-outreach for listing {listing.get('id')}: {_out_err}")
-                    print(f"    Auto Apply: {auto_count} approved from {len(selection['to_apply'])} accepted "
-                          f"(of {len(ranked)} ranked; {len(selection['filtered'])} filtered by rules, "
-                          f"{selection['capped_out']} held past daily cap) for {user.email}")
+                    # ONE shared autonomous pass - the same helper the manual /scan
+                    # endpoint uses, so the two can't drift. It enforces the user's
+                    # OWN acceptance rules (company always/never/boost, type, keywords,
+                    # signal strength, ghost risk, salary floor, deadline window,
+                    # remote-only) - the SAME logic the Auto page previews, so "what
+                    # you see" equals "what it does". Essential once autonomous consent
+                    # removes the undo window: the engine submits exactly the previewed
+                    # set, nothing else. The daily cap is the user's choice
+                    # (0 = unlimited, fully hands-off), not a forced rail.
+                    summary = auto_apply_and_outreach_for_user(db, anthropic_client, str(user.id), profile, ranked)
+                    auto_count = len(summary["applied"])
+                    outreach_count = len(summary["outreach"])
+                    print(f"    Auto Apply: {auto_count} approved "
+                          f"(of {summary['ranked_count']} ranked; {summary['filtered_count']} filtered by rules, "
+                          f"{summary['capped_out']} held past daily cap) for {user.email}")
                     print(f"    Auto Outreach: {outreach_count} new outreach draft(s) queued for {user.email}")
                     # Closes a real, confirmed gap: notifications.py's own
                     # docstring already claimed the scheduler "would call
