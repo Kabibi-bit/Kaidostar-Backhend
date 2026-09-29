@@ -1,0 +1,293 @@
+"""Server-side enforcement of the Auto Apply acceptance rules.
+ 
+This is the authoritative mirror of the client-side ``evalMatch()`` in
+auto.html. The Auto page lets a user narrow exactly what the engine is
+allowed to apply to - by company (never / always / boost), type,
+confidence threshold, remote-only, deadline window, required / excluded
+keywords, signal strength, ghost-job risk and salary floor - and shows a
+live preview of what would be acted on. Until now those rules only lived
+in the browser: the nightly scan applied on ``enabled + threshold`` alone,
+so the preview could promise "never apply to Acme" while the unattended
+engine did exactly that.
+ 
+For an autonomous engine that submits without an undo window, "what you
+see in the preview" MUST equal "what it actually does". So the scan now
+runs every candidate through :func:`evaluate_match` here - the same logic,
+field for field, as the client - and only acts on the ones that pass.
+ 
+The daily cap is the user's OWN choice, not a forced safety rail: 0 means
+unlimited (fully hands-off, matching the consent copy), any positive N
+caps how many the engine acts on per day.
+ 
+Nothing in this module does any I/O except :func:`remaining_daily_budget`,
+which counts today's auto-generated applications. Everything else is pure
+and unit-testable without a database.
+"""
+ 
+from __future__ import annotations
+ 
+from datetime import date, datetime, timezone
+ 
+ 
+# Byte-for-byte the same defaults as DEFAULT_RULES in state.js, so a user
+# who never opened the rules panel is treated identically on both layers.
+DEFAULT_RULES = {
+    "autonomous": False,       # true only after explicit, revocable consent
+    "mode": "auto_approve",    # 'auto_approve' | 'draft_only'
+    "outreach": True,          # also draft referral outreach for accepted matches
+    "types": {"job": True, "internship": True, "college": True},
+    "remoteOnly": False,
+    "deadlineMaxDays": 0,      # 0 = any; else only if closing within N days
+    "skipClosed": True,
+    "keywordsInclude": [],     # must contain at least one (if any set)
+    "keywordsExclude": [],     # must contain none
+    "requireStrongSignal": False,
+    "skipHighGhostRisk": True,
+    "salaryFloor": 0,          # 0 = no floor (in $k)
+    "dailyCap": 10,            # 0 = unlimited (fully hands-off)
+    "companies": [],           # [{name, rule:'always'|'never'|'boost'}]
+}
+ 
+# Rule keys that are lists, normalized defensively (mirrors state.js, which
+# coerces these three back to arrays after merging stored settings).
+_LIST_KEYS = ("keywordsInclude", "keywordsExclude", "companies")
+ 
+ 
+def merge_rules(stored) -> dict:
+    """Merge a stored rules dict over the defaults, exactly like the
+    client's ``Object.assign({}, DEFAULT_RULES, stored)`` followed by its
+    array coercion. Unknown keys are dropped; missing keys get defaults;
+    the three list keys are always real lists; ``types`` is always a dict.
+    """
+    r = {k: (dict(v) if isinstance(v, dict) else list(v) if isinstance(v, list) else v)
+         for k, v in DEFAULT_RULES.items()}
+    if isinstance(stored, dict):
+        for k, v in stored.items():
+            if k in DEFAULT_RULES:
+                r[k] = v
+    # Defensive normalization, matching the frontend.
+    if not isinstance(r.get("types"), dict):
+        r["types"] = dict(DEFAULT_RULES["types"])
+    for k in _LIST_KEYS:
+        if not isinstance(r.get(k), list):
+            r[k] = []
+    try:
+        r["dailyCap"] = max(0, int(r.get("dailyCap", 0) or 0))
+    except (TypeError, ValueError):
+        r["dailyCap"] = 0
+    try:
+        r["deadlineMaxDays"] = max(0, int(r.get("deadlineMaxDays", 0) or 0))
+    except (TypeError, ValueError):
+        r["deadlineMaxDays"] = 0
+    try:
+        r["salaryFloor"] = max(0, int(r.get("salaryFloor", 0) or 0))
+    except (TypeError, ValueError):
+        r["salaryFloor"] = 0
+    return r
+ 
+ 
+def _days_left(item: dict):
+    """Days until the listing's deadline (negative if passed), or None if
+    there's no deadline. Prefers the value the scorer already computed
+    (factors.days_left) so this can never disagree with the score; falls
+    back to parsing the raw ISO ``deadline`` field.
+    """
+    factors = item.get("factors")
+    if isinstance(factors, dict) and factors.get("days_left") is not None:
+        try:
+            return int(factors["days_left"])
+        except (TypeError, ValueError):
+            pass
+    deadline = item.get("deadline")
+    if not deadline:
+        return None
+    try:
+        d = date.fromisoformat(deadline) if isinstance(deadline, str) else deadline
+        if isinstance(d, datetime):
+            d = d.date()
+        if not isinstance(d, date):
+            return None
+        return (d - date.today()).days
+    except (TypeError, ValueError):
+        return None
+ 
+ 
+def _salary_k(salary_min):
+    """Normalize a listing's minimum salary to thousands of dollars ($k),
+    so it compares against the salaryFloor rule (which the UI labels "k").
+    Real ingested salaries are annual dollars (e.g. 95000); demo/seed and
+    already-normalized values are small ($k, e.g. 95). Handle both: >=1000
+    is treated as dollars and divided down, otherwise assumed already $k.
+    Returns None when there's no numeric salary to judge.
+    """
+    if not isinstance(salary_min, (int, float)) or isinstance(salary_min, bool):
+        return None
+    return salary_min / 1000.0 if salary_min >= 1000 else float(salary_min)
+ 
+ 
+def _company_match(companies, org_lower, rule):
+    """First company entry of the given rule whose name is a substring of
+    the listing's org (same containment test the client uses)."""
+    for c in companies:
+        if not isinstance(c, dict):
+            continue
+        name = (c.get("name") or "").strip()
+        if c.get("rule") == rule and name and name.lower() in org_lower:
+            return c
+    return None
+ 
+ 
+def evaluate_match(item: dict, rules: dict, threshold: int) -> dict:
+    """Decide whether the autonomous engine may act on one scored listing.
+ 
+    ``item`` is a ranked/scored listing dict (a listing merged with its
+    match result: ``org``, ``type``, ``location``, ``title``, ``tags``,
+    ``description``, ``salary_min``, ``score_pct``, ``signal_strength``,
+    ``ghost_risk``, and ``factors.days_left``).
+ 
+    Returns ``{"accept": bool, "blocks": [reasons...], "reasons":
+    [reasons...]}`` - the exact shape and precedence of the client's
+    evalMatch, so the preview and the engine can never disagree.
+    """
+    blocks: list[str] = []
+    reasons: list[str] = []
+    org = (item.get("org") or "").lower()
+    companies = rules.get("companies") or []
+ 
+    # 1. never-apply company: hard stop, nothing else matters.
+    never = _company_match(companies, org, "never")
+    if never:
+        return {"accept": False, "blocks": ["On your never-apply list (%s)" % never["name"]], "reasons": []}
+ 
+    always = _company_match(companies, org, "always")
+    dl = _days_left(item)
+    if rules.get("skipClosed") and dl is not None and dl < 0:
+        blocks.append("Deadline passed")
+ 
+    # 2. always-apply company: bypasses every other filter EXCEPT a passed
+    #    deadline when skipClosed is on (mirrors the client precedence).
+    if always:
+        if blocks:
+            return {"accept": False, "blocks": blocks, "reasons": []}
+        return {"accept": True, "blocks": [], "reasons": ["Priority company (%s)" % always["name"]]}
+ 
+    # 3. type
+    typ = (item.get("type") or "").lower()
+    types = rules.get("types") or {}
+    if types.get(typ) is False:
+        blocks.append('"%s" type is off' % typ)
+ 
+    # 4. confidence threshold (the slider). Below it -> the engine doesn't
+    #    touch it; it's a "filtered out", not a queued near-miss.
+    try:
+        pct = int(item.get("score_pct") or 0)
+    except (TypeError, ValueError):
+        pct = 0
+    if pct < threshold:
+        blocks.append("Below %d%% (%d%%)" % (threshold, pct))
+    else:
+        reasons.append("%d%% confidence" % pct)
+ 
+    # 5. remote-only
+    if rules.get("remoteOnly") and "remote" not in (item.get("location") or "").lower():
+        blocks.append("Not remote")
+ 
+    # 6. deadline window
+    dmax = rules.get("deadlineMaxDays") or 0
+    if dmax > 0 and (dl is None or dl > dmax):
+        blocks.append("Not closing within %dd" % dmax)
+ 
+    # 7. keywords (over title + tags + description, same haystack as the client)
+    hay = " ".join([
+        str(item.get("title") or ""),
+        " ".join(str(t) for t in (item.get("tags") or [])),
+        str(item.get("description") or ""),
+    ]).lower()
+    include = [k for k in (rules.get("keywordsInclude") or []) if k]
+    if include and not any(str(k).lower() in hay for k in include):
+        blocks.append("Missing a required keyword")
+    bad = [k for k in (rules.get("keywordsExclude") or []) if k and str(k).lower() in hay]
+    if bad:
+        blocks.append("Has excluded: " + ", ".join(bad))
+ 
+    # 8. signal strength
+    if rules.get("requireStrongSignal") and (item.get("signal_strength") or "") != "high":
+        blocks.append("Signal not strong")
+ 
+    # 9. ghost-job risk
+    if rules.get("skipHighGhostRisk") and (item.get("ghost_risk") or "") == "high":
+        blocks.append("High ghost-job risk")
+ 
+    # 10. salary floor
+    floor = rules.get("salaryFloor") or 0
+    sal_k = _salary_k(item.get("salary_min"))
+    if floor > 0 and sal_k is not None and sal_k < floor:
+        blocks.append("Below $%dk" % floor)
+ 
+    # boost is a ranking/annotation hint, never an accept/reject reason.
+    if _company_match(companies, org, "boost"):
+        reasons.insert(0, "Prioritized company")
+ 
+    return {"accept": len(blocks) == 0, "blocks": blocks, "reasons": reasons}
+ 
+ 
+def select_matches_to_apply(ranked: list, rules: dict, threshold: int, already_today: int = 0) -> dict:
+    """Pure core of the scan's decision. Given the ranked candidates and
+    the user's rules, return which listings the engine should act on now,
+    which were filtered out (with the first reason), and how many passed
+    but sit past today's cap.
+ 
+    ``already_today`` is how many auto-applications were already made today,
+    so a mid-day scan doesn't exceed the daily cap. dailyCap 0 = unlimited.
+ 
+    Highest confidence first, exactly like the preview's ordering, so the
+    cap always spends its budget on the strongest matches.
+    """
+    accepted = []
+    filtered = []
+    for item in (ranked or []):
+        verdict = evaluate_match(item, rules, threshold)
+        if verdict["accept"]:
+            accepted.append({"item": item, "reasons": verdict["reasons"]})
+        else:
+            filtered.append({"item": item, "block": (verdict["blocks"][0] if verdict["blocks"] else "filtered")})
+ 
+    accepted.sort(key=lambda a: (a["item"].get("score_pct") or 0), reverse=True)
+ 
+    cap = rules.get("dailyCap") or 0
+    if cap and cap > 0:
+        budget = max(0, cap - max(0, already_today))
+        to_apply = accepted[:budget]
+        capped_out = max(0, len(accepted) - budget)
+    else:
+        to_apply = accepted
+        capped_out = 0
+ 
+    return {"to_apply": to_apply, "filtered": filtered, "capped_out": capped_out, "accepted_total": len(accepted)}
+ 
+ 
+def _start_of_today_utc() -> datetime:
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+ 
+ 
+def applications_made_today(db, user_id) -> int:
+    """How many applications the engine itself created today (UTC), so the
+    daily cap is a true per-day limit across every scan in the day, not
+    just per scan. Fail-safe: on any read error, return 0 (treat as none
+    made yet) rather than blocking the engine.
+    """
+    try:
+        from app.models.db_models import Application
+        return (
+            db.query(Application)
+            .filter(
+                Application.user_id == user_id,
+                Application.auto_generated == True,  # noqa: E712
+                Application.created_at >= _start_of_today_utc().replace(tzinfo=None),
+            )
+            .count()
+        )
+    except Exception:
+        return 0
+ 
