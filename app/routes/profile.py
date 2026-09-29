@@ -190,6 +190,8 @@ def create_profile(payload: SurveyIn, db: Session = Depends(get_db), authorizati
     if _prev is not None:
         profile_fields["auto_apply_enabled"] = _prev.auto_apply_enabled
         profile_fields["auto_apply_threshold"] = _prev.auto_apply_threshold
+        if getattr(_prev, "auto_apply_rules", None) is not None:
+            profile_fields["auto_apply_rules"] = _prev.auto_apply_rules
         if getattr(_prev, "notification_preferences", None) is not None:
             profile_fields["notification_preferences"] = _prev.notification_preferences
  
@@ -366,6 +368,7 @@ def get_potential_score(user_id: str, db: Session = Depends(get_db), _auth: dict
 class AutoApplySettingsIn(BaseModel):
     enabled: bool
     threshold: int = Field(default=80, ge=0, le=100)  # confidence gate %, must be 0-100 or auto-send behaves nonsensically
+    rules: dict | None = None  # the Auto acceptance rules (types, locations, keywords, per-company rules, etc.); optional so an older client sending only enabled/threshold still works
  
  
 @router.post("/{user_id}/auto-apply-settings")
@@ -395,8 +398,18 @@ def set_auto_apply_settings(user_id: str, payload: AutoApplySettingsIn, db: Sess
         raise HTTPException(status_code=404, detail="No current profile for this user")
     profile.auto_apply_enabled = payload.enabled
     profile.auto_apply_threshold = payload.threshold
+    if payload.rules is not None:
+        # Keep the JSONB row bounded - these are a handful of small settings,
+        # never a place to park bulk data.
+        import json as _json
+        try:
+            if len(payload.rules) > 40 or len(_json.dumps(payload.rules)) > 20000:
+                raise HTTPException(status_code=400, detail="rules object is too large")
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="rules is not JSON-serializable")
+        profile.auto_apply_rules = payload.rules
     db.commit()
-    return {"status": "updated", "enabled": profile.auto_apply_enabled, "threshold": profile.auto_apply_threshold}
+    return {"status": "updated", "enabled": profile.auto_apply_enabled, "threshold": profile.auto_apply_threshold, "rules": profile.auto_apply_rules}
  
  
 @router.get("/{user_id}/auto-apply-settings")
@@ -413,7 +426,7 @@ def get_auto_apply_settings(user_id: str, db: Session = Depends(get_db), _auth: 
     )
     if not profile:
         raise HTTPException(status_code=404, detail="No current profile for this user")
-    return {"enabled": profile.auto_apply_enabled, "threshold": profile.auto_apply_threshold}
+    return {"enabled": profile.auto_apply_enabled, "threshold": profile.auto_apply_threshold, "rules": profile.auto_apply_rules}
  
  
 class AutoSubmitConsentIn(BaseModel):
