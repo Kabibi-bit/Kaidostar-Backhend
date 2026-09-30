@@ -27,6 +27,12 @@ class ChatIn(BaseModel):
     user_id: str
     message: str = Field(max_length=8000)
     history: list[dict] = Field(default=[], max_length=100)
+    # Workspace context the full Metis workspace composes from the user's OWN
+    # material: the active project's instructions, their Metis customisation
+    # (name / tone / focus / custom instructions), and their upcoming schedule.
+    # Appended to the system prompt so Metis actually reasons over the project
+    # and schedule the user is working in. Bounded so it can't balloon the call.
+    extra_context: str = Field(default="", max_length=6000)
  
     @field_validator("history")
     @classmethod
@@ -110,6 +116,12 @@ def chat(payload: ChatIn, db: Session = Depends(get_db), authorization: str = He
     verify_token_belongs_to_user(payload.user_id, authorization)
     rate_limit_by_tier(db, payload.user_id, "metis-chat", per_action_limit=300)
     system = build_system_context(db, payload.user_id)
+    # The workspace's own context (active project instructions, the user's Metis
+    # customisation, and their upcoming schedule) - the user's own material,
+    # clearly delimited so Metis treats it as working context, not the base role.
+    if payload.extra_context and payload.extra_context.strip():
+        system += "\n\n--- Metis workspace context (from this user's own projects, settings and schedule) ---\n"
+        system += payload.extra_context.strip()
     messages = payload.history + [{"role": "user", "content": payload.message}]
  
     try:
