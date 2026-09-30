@@ -546,3 +546,29 @@ class WorkshopItem(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     __table_args__ = (UniqueConstraint("user_id", "kind", "client_id", name="uq_workshop_item_user_kind_client"),)
  
+ 
+class MetisItem(Base):
+    """Everything the full Metis workspace persists for a signed-in user, in one
+    generic table (same pattern as WorkshopItem). `kind` names the collection:
+ 
+      - conversation : a saved chat thread. data = {title, project_id, messages:[{role,content}], updated_at}
+      - project      : a Metis project. data = {name, instructions, color}
+      - schedule     : one tracked schedule/task item. data = {title, when, notes, done}
+      - settings     : the user's Metis customisation (a singleton). data = {name, tone, focus, instructions}
+ 
+    The browser generates each item's `client_id` and mirrors its own local
+    store here, so Metis's conversations, projects, schedule and settings follow
+    the user across devices - just like the rest of a signed-in user's data.
+    Writes are best-effort from the client (local-first), and upsert on
+    (user, kind, client_id) so a retry never duplicates a row.
+    """
+    __tablename__ = "metis_items"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    kind = Column(String, nullable=False)       # conversation | project | schedule | settings
+    client_id = Column(String, nullable=False)  # browser-generated id, unique per (user, kind)
+    data = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("user_id", "kind", "client_id", name="uq_metis_item_user_kind_client"),)
+ 
