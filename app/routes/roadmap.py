@@ -290,7 +290,7 @@ def explain_listing(user_id: str, listing_id: str, db: Session = Depends(get_db)
     if client is None:
         from fastapi import HTTPException as _HE
         raise _HE(status_code=503, detail="AI service is not configured. Please try again later.")
-    require_feature(db, user_id, "deep_match_explanations")
+    require_feature(db, user_id, "roadmap")  # this explains fit to the user's stored roadmap - a Roadmap (Pro+) feature, not the free Job Search deep-explain
     rate_limit_by_tier(db, user_id, "roadmap-explain", per_action_limit=200)
     """Returns Claude's explanation of how one specific listing fits
     the user's stored roadmap.
