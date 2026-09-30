@@ -21,7 +21,7 @@ TIER_ORDER = ["free", "pro", "max"]
 # Feature flags per tier. MUST match kaidostar/state.js TIERS[*].features.
 TIER_FEATURES = {
     "free": {
-        "opportunity_watch": True, "roadmap": True, "metis": True, "manual_drafting": True,
+        "opportunity_watch": True, "roadmap": False, "metis": True, "manual_drafting": True,
         "school_readiness": True,
         "workshop": False,
         "deep_match_explanations": False,
