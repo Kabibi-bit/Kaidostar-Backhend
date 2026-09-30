@@ -11,6 +11,7 @@ from app.db import get_db
 from app.models.db_models import Profile, RoadmapSummary
 from app.services.market_research import research_company, generate_interview_prep, mock_interview_turn
 from app.services.rate_limit import rate_limit_by_tier
+from app.services.tiers import require_feature
  
 _log = logging.getLogger("kaidostar")
 router = APIRouter(prefix="/market", tags=["market"])
@@ -77,6 +78,7 @@ def interview_prep_route(payload: InterviewPrepIn, db: Session = Depends(get_db)
     )
     if not profile:
         raise HTTPException(status_code=404, detail="No current profile for this user")
+    require_feature(db, payload.user_id, "interview_prep")  # Interview Prep is Pro+
     rate_limit_by_tier(db, payload.user_id, "interview-prep", per_action_limit=300)
  
     roadmap_summary_row = db.query(RoadmapSummary).filter(RoadmapSummary.user_id == payload.user_id).first()
@@ -118,6 +120,7 @@ def mock_interview_route(payload: MockInterviewIn, db: Session = Depends(get_db)
     verify_token_belongs_to_user(payload.user_id, authorization)
     if not (payload.role_title or "").strip():
         raise HTTPException(status_code=400, detail="role_title is required")
+    require_feature(db, payload.user_id, "interview_prep")  # Interview Prep is Pro+
     rate_limit_by_tier(db, payload.user_id, "mock-interview", per_action_limit=400)
     try:
         result = mock_interview_turn(
