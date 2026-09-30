@@ -12,6 +12,7 @@ from app.services.ai_client import get_client
 from app.db import get_db
 from app.models.db_models import Profile, Listing, RoadmapMilestone, RoadmapSummary, SocialPost
 from app.services.roadmap import generate_roadmap, explain_listing_against_roadmap
+from app.services.pathways import generate_pathways
 from app.services.matching import rank_listings, _terms_match, tokenize
  
 _log = logging.getLogger("kaidostar")
@@ -59,6 +60,62 @@ def _compute_skill_gaps(db: Session, profile_dict: dict) -> list[str]:
             if not known:
                 freq[tag] = freq.get(tag, 0) + 1
     return [tag for tag, _ in sorted(freq.items(), key=lambda kv: -kv[1])[:4]]
+ 
+ 
+def _ranked_listings(db: Session, profile_dict: dict, top_n: int = 10) -> list:
+    """Real listings, scored and ranked for this user - the ground truth the
+    pathways atlas is built from (supporting matches, top match, gap tags)."""
+    listings = db.query(Listing).all()
+    if not listings:
+        return []
+    listing_dicts = [
+        {
+            "id": str(l.id), "type": l.type, "title": l.title, "org": l.org, "tags": l.tags or [],
+            "location": l.location, "deadline": l.deadline.isoformat() if l.deadline else None,
+            "description": l.description or "",
+        }
+        for l in listings
+    ]
+    return rank_listings(listing_dicts, profile_dict, top_n=top_n)
+ 
+ 
+def _gaps_from_ranked(ranked: list, profile_dict: dict) -> list[str]:
+    skill_tokens = tokenize(profile_dict.get("skills", "") or "")
+    goal_tokens = tokenize((profile_dict["northstar"] + " " + profile_dict.get("final_idea", "")) or "")
+    freq = {}
+    for listing in ranked:
+        for tag in listing.get("tags", []):
+            known = any(_terms_match(t, tag) for t in skill_tokens) or any(_terms_match(t, tag) for t in goal_tokens)
+            if not known:
+                freq[tag] = freq.get(tag, 0) + 1
+    return [tag for tag, _ in sorted(freq.items(), key=lambda kv: -kv[1])[:4]]
+ 
+ 
+@router.get("/{user_id}/pathways")
+def get_pathways(user_id: str, db: Session = Depends(get_db), _auth: dict = Depends(require_auth_for_user)):
+    """The Pathways Atlas: a branching graph of dozens of real routes from
+    where the person is now to their goal, grounded in their real ranked
+    listings, plus the engine's authoritative recommendation. The browser
+    renders this and re-scores live as the person adjusts constraints; this
+    is the server-side source of truth for the graph and the initial pick.
+    """
+    import uuid as uuid_module
+    try:
+        uuid_module.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="No current profile for this user")
+    rate_limit_by_tier(db, user_id, "pathways", per_action_limit=400)
+    profile = (
+        db.query(Profile)
+        .filter(Profile.user_id == user_id, Profile.is_current == True)  # noqa: E712
+        .first()
+    )
+    if not profile:
+        raise HTTPException(status_code=404, detail="No current profile for this user")
+    profile_dict = _profile_to_dict(profile)
+    ranked = _ranked_listings(db, profile_dict, top_n=10)
+    skill_gaps = _gaps_from_ranked(ranked, profile_dict)
+    return generate_pathways(profile_dict, ranked, skill_gaps)
  
  
 @router.post("/{user_id}")
