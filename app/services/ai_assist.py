@@ -118,6 +118,60 @@ def _b(task, i, profile):
                 f". Their notes on how it went: \"{g('notes','none given')}\". Give a short, honest debrief: what likely went well, "
                 f"what to shore up for next time, and a brief follow-up thank-you note they could send now. {_ANTI_FAB}\n\nReturn "
                 "short headed sections.")
+    # ---- Job Search dashboard "AI Copilot" tasks ----
+    # These reason over the candidate's live, ranked match set (passed in as a
+    # compact text list the client assembles) plus their real profile.
+    if task == "search_briefing":
+        return (f"You are a job-search copilot. The candidate's current ranked matches:\n{g('matches')}\n\n{p}\n\n"
+                f"Give a short daily briefing (5-6 sentences): the 2-3 themes across these matches, what to prioritise today, "
+                f"and one thing to watch (a deadline, a ghost-risk, or a gap). {_ANTI_FAB} Ground every point in the listed "
+                "matches. Plain prose, no preamble, no list.")
+    if task == "search_triage":
+        return (f"The candidate can only put real effort into a few applications. Their current matches:\n{g('matches')}\n\n{p}\n\n"
+                f"Pick the 3-5 to apply to FIRST, strongest first, each with one honest reason (fit, freshness, deadline, or upside). "
+                f"{_ANTI_FAB} Return a numbered list, each line: \"Title at Org - reason\".")
+    if task == "search_skill_gaps":
+        return (f"Across the candidate's current matches, these skills recur but are NOT in their stated skills: "
+                f"\"{g('gaps','(none detected)')}\". Their matches:\n{g('matches')}\n\n{p}\n\nExplain which gap to close first and why, "
+                f"with one concrete first step per gap (top 3 max). {_ANTI_FAB} Short headed sections.")
+    if task == "search_strategy":
+        return (f"The shape of the candidate's current search: {g('stats')}. {p}\n\nAdvise how to run the search over the next week: "
+                f"whether to broaden or narrow, where to focus effort, and one thing to STOP doing. {_ANTI_FAB} Concrete, grounded in "
+                "the numbers given. 4-6 sentences.")
+    if task == "market_pulse":
+        return (f"Across the candidate's current matches, the most common skills/tags are: {g('trend')}. {p}\n\nIn 4-5 sentences, tell "
+                f"them what this says about what's in demand for their target and how to position themselves to match it. {_ANTI_FAB} "
+                "Ground it only in the tags given.")
+    if task == "search_next_action":
+        return (f"The candidate's current search snapshot: {g('stats')}. Their top matches:\n{g('matches')}\n\n{p}\n\nName the single "
+                f"most valuable thing they should do in the next hour, and exactly how to start it. {_ANTI_FAB} 2-3 sentences, "
+                "imperative, no list.")
+    if task == "search_answer":
+        return (f"The candidate is looking at this match set:\n{g('matches')}\n\n{p}\n\nAnswer their question using ONLY these matches "
+                f"and their real profile: \"{g('question')}\". {_ANTI_FAB} If the matches don't contain the answer, say so plainly. "
+                "Be concise.")
+    if task == "fit_read":
+        return (f"Give an honest fit read of ONE role for this candidate. Role: \"{g('title')}\" at \"{g('org')}\" "
+                f"({g('pct')}% modelled fit). Tags: {g('tags')}. Location: {g('loc','n/a')}. {p}{bg_line}\n\nCover what genuinely fits, "
+                f"the real gaps, and end with a one-word verdict (Apply / Maybe / Skip) and a single reason. {_ANTI_FAB} 4-6 sentences, "
+                "put the verdict on its own final line.")
+    if task == "application_hook":
+        return (f"Write ONE tailored opening line to start an application or outreach for \"{g('title')}\" at \"{g('org')}\" "
+                f"(tags: {g('tags')}). It must connect the candidate's REAL background to this specific role - no invented facts. "
+                f"{_ANTI_FAB}\n\n{p}{bg_line}\n\nReturn only the single line.")
+    if task == "application_redflags":
+        return (f"Before the candidate spends an application on \"{g('title')}\" at \"{g('org')}\" (tags: {g('tags')}; "
+                f"ghost-risk: {g('ghost','unknown')}; signal: {g('signal','unknown')}; deadline: {g('deadline','none')}), name the real "
+                f"risks or red flags and how to de-risk each. If it looks solid, say so plainly. {_ANTI_FAB} 3-5 short bullets.")
+    if task == "role_prep":
+        return (f"List the 5-6 interview questions the candidate should most expect for \"{g('title')}\" at \"{g('org')}\", grounded in "
+                f"the real demands of that kind of role, each with a one-line note on what a strong answer shows. {_ANTI_FAB}\n\n{p}\n\n"
+                "Return a numbered list.")
+    if task == "salary_context":
+        return (f"Give honest compensation context for \"{g('title')}\" in \"{g('loc','their market')}\""
+                + (f" (the listing states a floor around {g('salary')})" if g('salary') else "") +
+                f". {_ANTI_FAB} Do NOT invent specific numbers - use [research: typical range for this role/location] placeholders they "
+                f"can fill, and give one concrete negotiation angle grounded in their real skills.\n\n{p}\n\nReturn short headed sections.")
     raise ValueError(f"unknown task: {task}")
  
  
@@ -126,6 +180,10 @@ ALLOWED_TASKS = {
     "cover_letter", "linkedin_headline", "linkedin_about", "skills_gap", "jd_tailor", "outreach",
     "answer_feedback", "tmays", "role_questions", "behavioral_story", "weakness_frame", "why_us",
     "post_interview_debrief",
+    # Job Search dashboard copilot
+    "search_briefing", "search_triage", "search_skill_gaps", "search_strategy", "market_pulse",
+    "search_next_action", "search_answer", "fit_read", "application_hook", "application_redflags",
+    "role_prep", "salary_context",
 }
  
  
