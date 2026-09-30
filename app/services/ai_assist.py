@@ -186,6 +186,15 @@ ALLOWED_TASKS = {
     "role_prep", "salary_context",
 }
  
+# The Job Search "AI Copilot" tools are a Pro feature. These tasks are gated
+# server-side by the ai_copilot flag so a Free account can't reach them by
+# calling the generic endpoint directly (the UI panel is gated too).
+COPILOT_TASKS = {
+    "search_briefing", "search_triage", "search_skill_gaps", "search_strategy", "market_pulse",
+    "search_next_action", "search_answer", "fit_read", "application_hook", "application_redflags",
+    "role_prep", "salary_context",
+}
+ 
  
 def run_assist(anthropic_client, task: str, inputs: dict, profile: dict) -> str:
     prompt = _b(task, inputs or {}, profile or {})
