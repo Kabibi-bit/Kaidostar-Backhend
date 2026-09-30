@@ -104,6 +104,7 @@ def get_pathways(user_id: str, db: Session = Depends(get_db), _auth: dict = Depe
         uuid_module.UUID(user_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="No current profile for this user")
+    require_feature(db, user_id, "roadmap")  # Roadmap (incl. the Pathways Atlas) is Pro+
     rate_limit_by_tier(db, user_id, "pathways", per_action_limit=400)
     profile = (
         db.query(Profile)
@@ -143,6 +144,7 @@ def create_roadmap(user_id: str, db: Session = Depends(get_db), _auth: dict = De
     if not profile:
         raise HTTPException(status_code=404, detail="No current profile for this user")
  
+    require_feature(db, user_id, "roadmap")  # Roadmap is Pro+
     profile_dict = _profile_to_dict(profile)
     skill_gaps = _compute_skill_gaps(db, profile_dict)
     try:
@@ -196,6 +198,7 @@ def get_roadmap(user_id: str, db: Session = Depends(get_db), _auth: dict = Depen
         uuid_module.UUID(user_id)
     except ValueError:
         return {"milestones": [], "summary": None, "note": "No roadmap yet - POST to this URL to generate one."}
+    require_feature(db, user_id, "roadmap")  # Roadmap is Pro+
     milestones = (
         db.query(RoadmapMilestone)
         .filter(RoadmapMilestone.user_id == user_id)
