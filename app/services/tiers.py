@@ -24,8 +24,10 @@ TIER_FEATURES = {
         "opportunity_watch": True, "roadmap": False, "metis": True, "manual_drafting": True,
         "school_readiness": True,
         "interview_prep": False,
+        "ai_copilot": True,           # Job Search AI Copilot - FREE (whole Job Search page is free)
+        "advanced_search": True,      # Personalised weight-tuning - FREE
         "workshop": False,
-        "deep_match_explanations": False,
+        "deep_match_explanations": True,  # Deep match explanations live on Job Search - FREE
         "outreach_drafting": False,
         "auto_mode": False,
         "auto_submit": False,
@@ -36,6 +38,8 @@ TIER_FEATURES = {
         "opportunity_watch": True, "roadmap": True, "metis": True, "manual_drafting": True,
         "school_readiness": True,
         "interview_prep": True,
+        "ai_copilot": True,
+        "advanced_search": True,
         "workshop": True,
         "deep_match_explanations": True,
         "outreach_drafting": True,
@@ -47,6 +51,8 @@ TIER_FEATURES = {
     "max": {
         "opportunity_watch": True, "roadmap": True, "metis": True, "manual_drafting": True,
         "interview_prep": True,
+        "ai_copilot": True,
+        "advanced_search": True,
         "workshop": True,
         "school_readiness": True, "deep_match_explanations": True, "outreach_drafting": True,
         "auto_mode": True,
@@ -77,7 +83,7 @@ FEATURE_DAILY_CAPS = {
     "essay-polish":       {"free": 5,  "pro": 50,  "max": 1000},
     "essay-brainstorm":   {"free": 5,  "pro": 50,  "max": 1000},
     "outreach-draft":     {"free": 0,  "pro": 40,  "max": 1000},  # 0 = gated (Pro+ feature)
-    "deep-explain":       {"free": 0,  "pro": 80,  "max": 1000},  # 0 = gated (Pro+ feature)
+    "deep-explain":       {"free": 8,  "pro": 80,  "max": 1000},  # Job Search deep match explanations - FREE (generous free allowance)
     # Free features, but AI-costly - metered so Free can't run unlimited cost.
     # Generous free allowances since these are part of the free experience.
     "metis-chat":         {"free": 25, "pro": 200, "max": 1000},
