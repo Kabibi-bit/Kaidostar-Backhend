@@ -172,6 +172,34 @@ def _b(task, i, profile):
                 + (f" (the listing states a floor around {g('salary')})" if g('salary') else "") +
                 f". {_ANTI_FAB} Do NOT invent specific numbers - use [research: typical range for this role/location] placeholders they "
                 f"can fill, and give one concrete negotiation angle grounded in their real skills.\n\n{p}\n\nReturn short headed sections.")
+    # ---- Mission control "Metis read-out": reads the whole dashboard snapshot
+    # (every real stat the page computed) and distils it to a simple, prioritised
+    # read-out. Grounded HARD in the snapshot - it must invent no metric. ----
+    if task == "overview_briefing":
+        return (f"You are Metis, the candidate's career copilot, reading their whole Mission Control dashboard. "
+                f"Here is the real, current snapshot of their search - every number in it is genuine:\n\n{g('snapshot')}\n\n{p}\n\n"
+                f"Distil this into a simple read-out that a busy person can act on. {_ANTI_FAB} Use ONLY the numbers and facts in the "
+                f"snapshot above - never invent a statistic, deadline, company, or outcome, and never restate a number the snapshot "
+                f"doesn't contain. Prioritise what actually moves their search forward. Return EXACTLY this structure and nothing else:\n"
+                f"STATUS: <one plain-English sentence on where they stand overall right now>\n"
+                f"KEY POINTS:\n- <one short sentence>\n- <one short sentence>\n- <one short sentence>\n"
+                f"(3 to 5 key points - the most important signals in the snapshot, each grounded in a real number from it)\n"
+                f"NEXT MOVES:\n- <imperative action tied to a real number in the snapshot>\n- <imperative action>\n"
+                f"(up to 3, highest-leverage first)")
+    # ---- Inbox copilot: triage the user's notifications/inbox and name the few
+    # items that most deserve a response or action now. Grounded HARD in the real
+    # items passed in - invents no message, company, deadline or number. ----
+    if task == "inbox_triage":
+        return (f"You are Metis, the candidate's copilot, triaging their Kaidostar inbox. Here are their current inbox "
+                f"items (newest first), each with its kind, age, source and whether it's unread:\n\n{g('items')}\n\n{p}\n\n"
+                f"Tell them which items most deserve a response or action RIGHT NOW, and why. {_ANTI_FAB} Use ONLY the items "
+                f"above - never invent a message, company, deadline, percentage or outcome, and never reference an item that "
+                f"isn't listed. Prioritise anything time-sensitive (a closing deadline, an undo window, a high-fit match) or "
+                f"awaiting the user. Return EXACTLY this structure and nothing else:\n"
+                f"TOP:\n- <the item's title> — <one short reason it's worth acting on now>\n- <...>\n"
+                f"(1 to 3 items, most urgent first; if genuinely nothing needs action, write a single line: "
+                f"'Nothing needs a response right now.')\n"
+                f"THEN: <one short sentence on what to do with the rest - skim, archive, or ignore>")
     raise ValueError(f"unknown task: {task}")
  
  
@@ -184,6 +212,8 @@ ALLOWED_TASKS = {
     "search_briefing", "search_triage", "search_skill_gaps", "search_strategy", "market_pulse",
     "search_next_action", "search_answer", "fit_read", "application_hook", "application_redflags",
     "role_prep", "salary_context",
+    # Mission control Metis read-out + Inbox triage (free - Metis is free for every tier)
+    "overview_briefing", "inbox_triage",
 }
  
 # The Job Search "AI Copilot" tools are a Pro feature. These tasks are gated
