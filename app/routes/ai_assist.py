@@ -74,8 +74,12 @@ def assist_route(payload: AssistIn, db: Session = Depends(get_db), authorization
     }
     try:
         result = run_assist(client, payload.task, payload.inputs, profile)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError:
+        # Don't surface the raw exception text to the client. The task name is
+        # already validated against ALLOWED_TASKS above, so this is an invalid-
+        # inputs case - log it server-side, return a generic message.
+        _log.warning("AI assist rejected task %s (invalid inputs)", payload.task)
+        raise HTTPException(status_code=400, detail="This request isn't valid for that tool - check your inputs and try again.")
     except Exception as e:
         _log.warning("AI assist failed for task %s - %s", payload.task, e)
         raise HTTPException(status_code=502, detail="Could not generate this just now. Please try again.")
