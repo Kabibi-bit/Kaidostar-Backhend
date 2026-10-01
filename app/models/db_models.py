@@ -25,6 +25,11 @@ class User(Base):
     # Subscription tier: 'free' | 'pro' | 'max'. Enforced server-side (see
     # app/services/tiers.py). Defaults to free; set via billing later.
     tier = Column(String, nullable=False, default="free")
+    # Whether the signup email has been confirmed via an emailed code. New
+    # accounts start False and must verify before the account is usable;
+    # existing rows are grandfathered to True by the migration so they aren't
+    # locked out. Login also requires this to be True.
+    email_verified = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
  
     profiles = relationship("Profile", back_populates="user")
@@ -571,4 +576,19 @@ class MetisItem(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     __table_args__ = (UniqueConstraint("user_id", "kind", "client_id", name="uq_metis_item_user_kind_client"),)
+ 
+ 
+class AuthCode(Base):
+    """One-time 6-digit codes for email verification and login 2FA. Only the
+    code's hash is stored, with a short expiry and an attempt counter (see
+    app/services/auth_codes.py). One active code per (user, purpose) - issuing a
+    new one clears the old; a correct code is deleted on use."""
+    __tablename__ = "auth_codes"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    purpose = Column(String, nullable=False)     # verify_email | login_2fa
+    code_hash = Column(String, nullable=False)   # sha256(code + server pepper)
+    expires_at = Column(DateTime, nullable=False)
+    attempts = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
  
