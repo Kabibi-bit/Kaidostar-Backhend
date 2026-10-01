@@ -200,6 +200,24 @@ def _b(task, i, profile):
                 f"(1 to 3 items, most urgent first; if genuinely nothing needs action, write a single line: "
                 f"'Nothing needs a response right now.')\n"
                 f"THEN: <one short sentence on what to do with the rest - skim, archive, or ignore>")
+    # ---- Explore: AI-reasoned career directions from the user's self-assessment.
+    # Returns STRICT JSON so the frontend can render rich, structured cards and,
+    # when the user commits to one, re-target the whole app to it. ----
+    if task == "explore_directions":
+        return (
+            "You are Metis, a sharp, honest career guide. From this person's real self-assessment, propose the career "
+            "directions that genuinely fit THEM - grounded in the specific evidence they gave, never generic categories.\n\n"
+            f"Their assessment:\n{g('answers')}\n\n{p}\n\n{_ANTI_FAB} Propose 4 distinct directions, strongest fit first; "
+            "tie each one concretely to what they actually wrote. Return ONLY a JSON array - no prose, no code fence - of 4 "
+            "objects with EXACTLY these keys:\n"
+            '[{"title": "short direction name", "description": "one sentence", "why_fits": "grounded in their specific '
+            'answers", "day_to_day": "what the work actually looks like", "transferable_skills": ["skills they ALREADY '
+            'showed evidence of"], "skills_to_build": ["honest gaps"], "typical_roles": ["2-4 real entry-level titles"], '
+            '"outlook": "one honest sentence on demand/competition", "first_step": "one concrete action this week", '
+            '"target_types": ["subset of job, internship, college"], "search_terms": ["3-6 keywords to find matching '
+            'listings"], "fit": 0-100}]\n'
+            "Never invent a credential, statistic or specific employer. Keep every string tight and specific to them."
+        )
     raise ValueError(f"unknown task: {task}")
  
  
@@ -212,8 +230,8 @@ ALLOWED_TASKS = {
     "search_briefing", "search_triage", "search_skill_gaps", "search_strategy", "market_pulse",
     "search_next_action", "search_answer", "fit_read", "application_hook", "application_redflags",
     "role_prep", "salary_context",
-    # Mission control Metis read-out + Inbox triage (free - Metis is free for every tier)
-    "overview_briefing", "inbox_triage",
+    # Mission control read-out, Inbox triage, Explore directions (free - Metis is free for every tier)
+    "overview_briefing", "inbox_triage", "explore_directions",
 }
  
 # The Job Search "AI Copilot" tools are a Pro feature. These tasks are gated
