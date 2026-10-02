@@ -1,7 +1,7 @@
 import os
 import logging
 from datetime import datetime
-from fastapi import APIRouter, HTTPException, Depends, Header
+from fastapi import APIRouter, HTTPException, Depends, Header, UploadFile, File, Form
 from app.services.auth import require_auth_for_user, verify_token_belongs_to_user
 from app.services.rate_limit import rate_limit, rate_limit_by_tier
 from pydantic import BaseModel, Field
@@ -15,6 +15,82 @@ from app.services.timeutil import utcnow
  
 _log = logging.getLogger("kaidostar")
 router = APIRouter(prefix="/resume", tags=["resume"])
+ 
+ 
+@router.post("/ingest")
+async def ingest_resume(
+    user_id: str = Form(...),
+    text: str = Form(None),
+    url: str = Form(None),
+    file: UploadFile = File(None),
+    db: Session = Depends(get_db),
+    authorization: str = Header(None),
+):
+    """The "skip the survey - just give us your resume" fast path.
+ 
+    Accepts an uploaded file (PDF / .docx / .txt), pasted text, OR a link, pulls
+    out the plain text, and asks the model to EXTRACT a profile + the person's
+    real experience entries (never inventing anything - see the resume_profile
+    task and resume_ingest.parse_resume_profile_json). Returns a profile patch
+    the client saves before sending the person straight into the job search.
+    """
+    import uuid as uuid_module
+    from app.services.resume_ingest import (
+        extract_resume_text, fetch_url_text, parse_resume_profile_json,
+        ResumeIngestError, MAX_RESUME_CHARS, MAX_FILE_BYTES,
+    )
+    from app.services.ai_assist import run_assist
+ 
+    try:
+        uuid_module.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="user_id is not a valid UUID")
+    verify_token_belongs_to_user(user_id, authorization)
+ 
+    client = get_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="AI service is not configured. Please try again later.")
+ 
+    # Assemble the resume text from whichever input was given.
+    resume_text = (text or "").strip()
+    if file is not None:
+        raw = await file.read()
+        if len(raw) > MAX_FILE_BYTES:
+            raise HTTPException(status_code=413, detail="That file is too large (max 4 MB).")
+        try:
+            extracted = extract_resume_text(file.filename or "", raw)
+        except ResumeIngestError as ve:
+            # user_message is a curated, non-sensitive string written for display.
+            raise HTTPException(status_code=422, detail=ve.user_message)
+        resume_text = (resume_text + "\n\n" + extracted).strip() if resume_text else extracted.strip()
+    elif url:
+        try:
+            fetched = fetch_url_text(url)
+        except ResumeIngestError as ve:
+            raise HTTPException(status_code=422, detail=ve.user_message)
+        resume_text = (resume_text + "\n\n" + fetched).strip() if resume_text else fetched.strip()
+ 
+    if not resume_text:
+        raise HTTPException(status_code=400, detail="No resume text found - upload a PDF/Word/TXT file, paste your resume, or add a link.")
+    resume_text = resume_text[:MAX_RESUME_CHARS]
+ 
+    # Metered like the other paid AI calls; fails open (see rate_limit_by_tier).
+    rate_limit_by_tier(db, user_id, "resume-ingest", per_action_limit=100)
+ 
+    try:
+        model_out = run_assist(client, "resume_profile", {"resume": resume_text}, {})
+    except Exception as e:
+        _log.warning("resume ingest model call failed - %s", e)
+        raise HTTPException(status_code=502, detail="Couldn't read your resume just now. Please try again, or fill in the survey.")
+ 
+    try:
+        profile, entries = parse_resume_profile_json(model_out)
+    except ValueError:
+        # The model returned something unparseable - don't ship a fake empty
+        # profile as if it worked; tell the client so it can fall back.
+        raise HTTPException(status_code=422, detail="Couldn't make sense of that resume - try pasting the text, or fill in the survey instead.")
+ 
+    return {"profile": profile, "entries": entries, "chars": len(resume_text)}
  
  
 class ResumeEntryIn(BaseModel):
