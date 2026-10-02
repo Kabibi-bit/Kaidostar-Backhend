@@ -398,3 +398,200 @@ def remove_skill_from_skills_string(current_skills: str, skill_to_remove: str) -
     remaining = [s for s in existing if s.lower() != skill_to_remove.lower()]
     return ", ".join(remaining)
  
+ 
+# ---------------------------------------------------------------------------
+# Per-job resume tailoring (the "edit the resume to suit each job" feature)
+# ---------------------------------------------------------------------------
+def _extract_json_object(text: str):
+    """Pull the first well-formed JSON object out of a model reply that may be
+    fenced or wrapped in prose. Returns a dict, or None if none is recoverable."""
+    import json
+    if not text:
+        return None
+    t = str(text).strip()
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", t, re.IGNORECASE)
+    if m:
+        t = m.group(1).strip()
+    a0, a1 = t.find("{"), t.rfind("}")
+    if a0 >= 0 and a1 > a0:
+        t = t[a0:a1 + 1]
+    try:
+        obj = json.loads(t)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+ 
+ 
+# Job-ad boilerplate that is never a real skill "gap" - filtered out so the
+# deterministic gaps read like missing skills, not scraped verbs/role words.
+_JD_BOILERPLATE = {
+    "hiring", "hire", "seeking", "looking", "must", "should", "strong", "ability",
+    "able", "role", "position", "candidate", "candidates", "join", "team", "work",
+    "working", "years", "year", "experience", "required", "require", "preferred",
+    "plus", "including", "responsibilities", "requirements", "qualifications",
+    "opportunity", "ideal", "great", "good", "excellent", "knowledge", "skills",
+    "familiar", "familiarity", "understanding", "analyst", "manager", "engineer",
+    "develop", "developer", "build", "builds", "help", "helping", "support",
+}
+ 
+ 
+def _jd_keywords(jd_text: str, limit: int = 40):
+    """Meaningful, de-duplicated keywords from a job description, minus common
+    job-ad boilerplate so a 'gap' reads like a real missing skill."""
+    toks = [t for t in sorted(_meaningful_tokens(jd_text or "")) if t not in _JD_BOILERPLATE]
+    return toks[:limit]
+ 
+ 
+def tailor_resume_deterministic(entries: list[dict], jd_text: str, profile: dict) -> dict:
+    """A no-AI, fully honest tailor: reorder the person's REAL entries by genuine
+    overlap with the job, split their own words into bullets, surface the real
+    skills the job asks for, and name honest gaps. It rewrites NOTHING - it's the
+    offline/fallback floor under the AI tailor, and a deterministic baseline the
+    frontend mirrors when logged out."""
+    entries = entries or []
+    jd_tokens = set(_jd_keywords(jd_text, 80))
+    ranked = rank_entries_for_listing(entries, {"tags": sorted(jd_tokens)})
+    out_entries = []
+    for e in ranked:
+        raw = (e.get("raw_description") or "").strip()
+        bullets = [s.strip(" -•\t") for s in re.split(r"[\n;.]+", raw) if s.strip(" -•\t")]
+        if not bullets and raw:
+            bullets = [raw]
+        score = e.get("relevance_score", 0)
+        rel = "high" if score >= 3 else "medium" if score >= 1 else "low"
+        out_entries.append({
+            "id": str(e.get("id") or e.get("entry_id") or ""),
+            "title": e.get("title") or "", "org": e.get("org") or "",
+            "dates": (f'{e.get("start_date") or ""} - {e.get("end_date") or ""}').strip(" -"),
+            "relevance": rel, "bullets": bullets[:5], "flagged_numbers": [], "note": "",
+        })
+    skills = [s.strip() for s in str(profile.get("skills") or "").split(",") if s.strip()]
+    foreground = [s for s in skills if jd_tokens and any(_terms_match(s.lower(), t) for t in jd_tokens)]
+    resume_tokens = set()
+    for e in entries:
+        resume_tokens |= set(tokenize(f"{e.get('title') or ''} {e.get('raw_description') or ''}"))
+    resume_tokens |= set(tokenize(" ".join(skills)))
+    gaps = [t for t in _jd_keywords(jd_text, 40) if not any(_terms_match(t, rt) for rt in resume_tokens)][:8]
+    return {
+        "summary": (profile.get("northstar") or "").strip(),
+        "summary_flagged_numbers": [], "foreground_skills": foreground[:12],
+        "gaps": gaps, "match_note": "", "entries": out_entries, "tailored_by": "deterministic",
+    }
+ 
+ 
+def tailor_resume_to_jd(anthropic_client, entries: list[dict], jd_text: str, profile: dict) -> dict:
+    """Jobright-style per-job tailoring, honest by construction. Rephrases the
+    person's REAL bullets to foreground what THIS job asks for - stronger verbs,
+    the job's own vocabulary where their real experience truly supports it,
+    relevant entries first - while the deterministic _find_fabricated_numbers net
+    flags any number the rewrite introduced that wasn't in the person's own words.
+    Never invents a tool, title, metric, or responsibility. Falls back to the
+    deterministic tailor if the model is unavailable or returns junk, so the route
+    always returns a usable tailored resume.
+ 
+    Returns the same shape as tailor_resume_deterministic, plus per-entry and
+    summary flagged_numbers and tailored_by="ai".
+    """
+    entries = [e for e in (entries or []) if (e.get("raw_description") or e.get("title"))]
+    if not entries:
+        return {"summary": "", "summary_flagged_numbers": [], "foreground_skills": [],
+                "gaps": [], "match_note": "", "entries": [], "tailored_by": "none"}
+    if anthropic_client is None:
+        return tailor_resume_deterministic(entries, jd_text, profile)
+ 
+    src, lines = {}, []
+    for i, e in enumerate(entries):
+        eid = str(e.get("id") or e.get("entry_id") or f"e{i}")
+        src[eid] = e
+        base = e.get("raw_description") or ""
+        if e.get("bullets"):
+            base = base + "\n" + "\n".join(b for b in e["bullets"] if isinstance(b, str))
+        lines.append(
+            f'[{eid}] {e.get("title") or "(untitled)"}' + (f' at {e.get("org")}' if e.get("org") else "")
+            + f'\nTheir own words: "{base.strip()}"'
+        )
+    entries_block = "\n\n".join(lines)
+    prompt = (
+        "You tailor a real person's resume to a specific job - like the best human resume coach, and strictly honest.\n\n"
+        f'Their stated goal: "{profile.get("northstar") or "not specified"}". Their skills: "{profile.get("skills") or "not specified"}".\n\n'
+        f"THE JOB:\n{(jd_text or '').strip()[:6000]}\n\n"
+        f"THEIR REAL EXPERIENCE (one block per entry, each with an [id]):\n{entries_block}\n\n"
+        "For each entry, rewrite its bullets to foreground what THIS job cares about: lead with the most relevant "
+        "real work, use strong action verbs, and use the job's own vocabulary ONLY where the person's real "
+        "experience genuinely matches it. You may re-emphasize and rephrase, but you may NEVER add a number, "
+        "percentage, tool, title, responsibility, or outcome that isn't in their own words above - a real person "
+        "submits this to a real employer. If an entry isn't relevant to this job, keep it short and mark it low "
+        "relevance rather than inflating it. Also write a 1-2 sentence summary tailored to this job (real facts "
+        "only), list which of their REAL skills to feature, and name the honest gaps - things this job wants that "
+        "their resume doesn't yet show.\n\n"
+        "Return ONLY a JSON object, no prose, no code fence:\n"
+        '{"summary":"", "foreground_skills":[], "gaps":[], "match_note":"one honest line on overall fit", '
+        '"entries":[{"id":"<the [id]>", "relevance":"high|medium|low", "bullets":["tailored bullet"], '
+        '"note":"what you emphasized and why"}]}'
+    )
+    try:
+        resp = anthropic_client.messages.create(
+            model="claude-sonnet-4-6", max_tokens=2600,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join((b.text or "") for b in resp.content if b.type == "text")
+    except Exception:
+        return tailor_resume_deterministic(entries, jd_text, profile)
+    obj = _extract_json_object(text)
+    if not obj or not isinstance(obj.get("entries"), list) or not obj["entries"]:
+        return tailor_resume_deterministic(entries, jd_text, profile)
+ 
+    def _clean_list(v, n):
+        if isinstance(v, str):
+            v = [x.strip() for x in v.split(",") if x.strip()]
+        return [str(x).strip() for x in v if str(x).strip()][:n] if isinstance(v, list) else []
+ 
+    out_entries, used = [], set()
+    for item in obj["entries"]:
+        if not isinstance(item, dict):
+            continue
+        eid = str(item.get("id") or "")
+        source = src.get(eid)
+        if source is None:
+            continue
+        used.add(eid)
+        original_text = (source.get("raw_description") or "")
+        if source.get("bullets"):
+            original_text += " " + " ".join(b for b in source["bullets"] if isinstance(b, str))
+        bullets = [b for b in (item.get("bullets") or []) if isinstance(b, str) and b.strip()][:6]
+        flagged = []
+        for b in bullets:
+            flagged.extend(_find_fabricated_numbers(original_text, b))
+        rel = str(item.get("relevance") or "").lower()
+        if rel not in ("high", "medium", "low"):
+            rel = "medium"
+        out_entries.append({
+            "id": eid, "title": source.get("title") or "", "org": source.get("org") or "",
+            "dates": (f'{source.get("start_date") or ""} - {source.get("end_date") or ""}').strip(" -"),
+            "relevance": rel,
+            "bullets": bullets or [b.strip() for b in re.split(r"[\n;.]+", original_text) if b.strip()][:4],
+            "flagged_numbers": sorted(set(flagged)), "note": str(item.get("note") or "")[:300],
+        })
+    # Keep any entry the model dropped, so nothing silently vanishes from the resume.
+    for eid, source in src.items():
+        if eid in used:
+            continue
+        raw = (source.get("raw_description") or "").strip()
+        bl = [s.strip(" -•\t") for s in re.split(r"[\n;.]+", raw) if s.strip(" -•\t")] or ([raw] if raw else [])
+        out_entries.append({
+            "id": eid, "title": source.get("title") or "", "org": source.get("org") or "",
+            "dates": (f'{source.get("start_date") or ""} - {source.get("end_date") or ""}').strip(" -"),
+            "relevance": "low", "bullets": bl[:4], "flagged_numbers": [], "note": "",
+        })
+ 
+    summary = str(obj.get("summary") or "").strip()
+    all_original = (profile.get("northstar") or "") + " " + " ".join((e.get("raw_description") or "") for e in entries)
+    summary_flagged = _find_fabricated_numbers(all_original, summary) if summary else []
+    return {
+        "summary": summary, "summary_flagged_numbers": summary_flagged,
+        "foreground_skills": _clean_list(obj.get("foreground_skills"), 12),
+        "gaps": _clean_list(obj.get("gaps"), 10),
+        "match_note": str(obj.get("match_note") or "")[:300],
+        "entries": out_entries, "tailored_by": "ai",
+    }
+ 
