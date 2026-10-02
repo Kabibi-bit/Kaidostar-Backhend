@@ -24,3 +24,6 @@ pytest==8.3.4
 # forms. The deploy must also install the browser binary: `playwright install
 # chromium`. If absent, auto-submit degrades safely to the manual hand-off.
 playwright==1.49.1
+pypdf==5.1.0
+python-multipart==0.0.18
+ 
