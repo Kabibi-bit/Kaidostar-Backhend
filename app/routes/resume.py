@@ -93,6 +93,119 @@ async def ingest_resume(
     return {"profile": profile, "entries": entries, "chars": len(resume_text)}
  
  
+class TailorToJdIn(BaseModel):
+    jd: str = Field(max_length=12000)
+    # The current builder entries (so tailoring matches exactly what the person
+    # sees, including just-imported or just-added ones). Falls back to the DB.
+    entries: list[dict] = Field(default_factory=list)
+ 
+ 
+@router.post("/{user_id}/tailor-to-jd")
+def tailor_resume_for_jd(user_id: str, payload: TailorToJdIn, db: Session = Depends(get_db), _auth: dict = Depends(require_auth_for_user)):
+    """Jobright-style per-job tailoring: rewrite the person's REAL resume to
+    foreground what this specific job asks for, honestly (see
+    resume_builder.tailor_resume_to_jd - it rephrases only, never invents, and
+    the fabrication net flags any number the rewrite added). Works on whatever
+    entries the builder currently has (sent in the body), or the saved ones.
+    """
+    import uuid as uuid_module
+    from app.services.resume_builder import tailor_resume_to_jd
+ 
+    client = get_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="AI service is not configured. Please try again later.")
+    try:
+        uuid_module.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="No profile for this user")
+    rate_limit_by_tier(db, user_id, "resume-tailor", per_action_limit=200)
+ 
+    # Prefer the entries the client sent (current builder state), clipped for size;
+    # otherwise fall back to the saved resume entries for this user.
+    entries = []
+    for e in (payload.entries or [])[:40]:
+        if not isinstance(e, dict):
+            continue
+        entries.append({
+            "id": str(e.get("id") or "")[:80],
+            "entry_type": str(e.get("entry_type") or "work")[:40],
+            "title": str(e.get("title") or "")[:300],
+            "org": str(e.get("org") or "")[:300],
+            "start_date": str(e.get("start_date") or "")[:50],
+            "end_date": str(e.get("end_date") or "")[:50],
+            "raw_description": str(e.get("raw_description") or "")[:5000],
+        })
+    if not entries:
+        rows = (
+            db.query(ResumeEntry)
+            .filter(ResumeEntry.user_id == user_id)
+            .order_by(ResumeEntry.display_order, ResumeEntry.created_at)
+            .all()
+        )
+        entries = [{"id": str(r.id), "entry_type": r.entry_type, "title": r.title, "org": r.org,
+                    "start_date": r.start_date, "end_date": r.end_date, "raw_description": r.raw_description} for r in rows]
+    if not entries:
+        raise HTTPException(status_code=400, detail="Add or import at least one real resume entry before tailoring.")
+ 
+    profile = db.query(Profile).filter(Profile.user_id == user_id, Profile.is_current == True).first()  # noqa: E712
+    profile_dict = {"northstar": profile.northstar if profile else "", "skills": (profile.skills or "") if profile else ""}
+ 
+    result = tailor_resume_to_jd(client, entries, payload.jd, profile_dict)
+    return result
+ 
+ 
+class TailorDownloadIn(BaseModel):
+    summary: str | None = Field(default="", max_length=2000)
+    skills: str | None = Field(default="", max_length=3000)
+    entries: list[dict] = Field(default_factory=list)
+ 
+ 
+@router.post("/{user_id}/tailor-to-jd/download")
+def download_tailored_to_jd(user_id: str, payload: TailorDownloadIn, db: Session = Depends(get_db), _auth: dict = Depends(require_auth_for_user)):
+    """Download the job-tailored resume as a real .docx. Reuses the same document
+    generator as the master resume - it only lays out the tailored content the
+    person just reviewed on screen, it generates nothing new."""
+    from fastapi import Response
+    from app.models.db_models import User
+    from app.services.resume_docx import generate_resume_document
+    import uuid as uuid_module
+ 
+    try:
+        uuid_module.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="No user found")
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="No user found")
+ 
+    polished_entries = []
+    for e in (payload.entries or [])[:40]:
+        if not isinstance(e, dict):
+            continue
+        bullets = [str(b)[:2000] for b in (e.get("bullets") or []) if isinstance(b, str) and b.strip()][:8]
+        polished_entries.append({
+            "entry_type": str(e.get("entry_type") or "work")[:40],
+            "title": str(e.get("title") or "")[:300],
+            "org": str(e.get("org") or "")[:300],
+            "dates": str(e.get("dates") or "")[:100],
+            "bullets": bullets,
+            "flagged_numbers": [],
+        })
+    if not polished_entries:
+        raise HTTPException(status_code=400, detail="Nothing to download yet - tailor your resume to a job first.")
+ 
+    skills_list = [s.strip() for s in str(payload.skills or "").split(",") if s.strip()][:40]
+    docx_bytes = generate_resume_document(
+        email=user.email, summary_line=(payload.summary or ""),
+        polished_entries=polished_entries, skills=skills_list,
+    )
+    return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": "attachment; filename=tailored_resume.docx"},
+    )
+ 
+ 
 class ResumeEntryIn(BaseModel):
     user_id: str
     entry_type: str = Field(max_length=50)  # work / education / project
