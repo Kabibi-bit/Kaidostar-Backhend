@@ -218,6 +218,31 @@ def _b(task, i, profile):
             'listings"], "fit": 0-100}]\n'
             "Never invent a credential, statistic or specific employer. Keep every string tight and specific to them."
         )
+    # ---- Resume fast-path: read a pasted/uploaded resume and extract a profile
+    # the whole app can act on, so the person can skip the questionnaire and go
+    # straight to the job search. STRICT JSON out. Everything here is EXTRACTED
+    # from their resume - never invented. raw_description must be copied verbatim
+    # from the resume (their own words), so the resume-builder's honesty guards
+    # downstream stay true. ----
+    if task == "resume_profile":
+        resume = _clip(i.get("resume", ""), 14000)
+        return (
+            "You are reading a person's real resume to set up their job search. Extract a structured profile and their "
+            "real experience entries. Extract ONLY what is actually in the resume - never invent, infer a number, or add a "
+            "skill, employer, title or date that isn't there. Copy experience text VERBATIM (their own words).\n\n"
+            f"RESUME:\n{resume}\n\n"
+            "Return ONLY a JSON object - no prose, no code fence - with EXACTLY these keys:\n"
+            '{"northstar": "one line: the role/field this resume is aimed at (from their objective, most recent or most '
+            'senior role); phrase as a goal", "finalidea": "" , "skills": "comma-separated real skills from the resume", '
+            '"loc": "their city/location if present, else \\"\\"", "stage": "one of student, grad, switch, working", '
+            '"timeframe": "now", "types": ["subset of job, internship, college"], "priorities": [], "dealbreakers": "", '
+            '"fullName": "their name from the top of the resume, else \\"\\"", "phone": "their phone if present, else \\"\\"", '
+            '"entries": [{"entry_type": "work|education|project", "title": "role or degree", "org": "employer/school", '
+            '"start_date": "", "end_date": "", "raw_description": "the exact bullet/description text from the resume, '
+            'verbatim"}]}\n'
+            "If the text does not look like a resume, return the object with empty strings and an empty entries array. "
+            "Leave any field you can't find as an empty string - never fill it with a guess."
+        )
     raise ValueError(f"unknown task: {task}")
  
  
@@ -230,8 +255,8 @@ ALLOWED_TASKS = {
     "search_briefing", "search_triage", "search_skill_gaps", "search_strategy", "market_pulse",
     "search_next_action", "search_answer", "fit_read", "application_hook", "application_redflags",
     "role_prep", "salary_context",
-    # Mission control read-out, Inbox triage, Explore directions (free - Metis is free for every tier)
-    "overview_briefing", "inbox_triage", "explore_directions",
+    # Mission control read-out, Inbox triage, Explore directions, Resume import (free - Metis is free for every tier)
+    "overview_briefing", "inbox_triage", "explore_directions", "resume_profile",
 }
  
 # The Job Search "AI Copilot" tools are a Pro feature. These tasks are gated
