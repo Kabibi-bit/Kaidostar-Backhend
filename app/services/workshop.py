@@ -29,6 +29,8 @@ ALLOWED_KINDS = {
     "achievement", "target_role", "pitch",
     # Interview Prep page:
     "interview_answer", "interview_ask",
+    # Resume Studio: saved resume versions (snapshot + which applications it went to)
+    "resume_version",
 }
  
  
