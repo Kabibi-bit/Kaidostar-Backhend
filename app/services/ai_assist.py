@@ -243,6 +243,42 @@ def _b(task, i, profile):
             "If the text does not look like a resume, return the object with empty strings and an empty entries array. "
             "Leave any field you can't find as an empty string - never fill it with a guess."
         )
+    # ---- Resume Studio (Workshop). All three are honesty-first: the frontend runs the
+    # deterministic fabrication check on every output before it can be applied. ----
+    if task == "metric_bullet":
+        # Metric Miner / XYZ Coach: one bullet, rebuilt from the person's OWN answers.
+        return (
+            "Rewrite ONE resume bullet using the extra details this person just typed about it. "
+            f"{_ANTI_FAB} Every number, tool, result and scope must come from the original bullet or their details - "
+            "if a detail is vague, stay vague; never round, estimate, or add a figure. Strong past-tense action verb first, "
+            "one line, under 30 words, no cliches, no first-person pronouns. Don't upgrade their role: if they took part, "
+            "say they contributed, not that they led.\n\n"
+            f"Original bullet: \"{g('bullet')}\"\nTheir details (their own words):\n{g('answers')}\n\n"
+            "Return only the rewritten bullet - no quotes, no commentary."
+        )
+    if task == "career_translate":
+        # Career-Switch Translator: same facts, the target field's vocabulary.
+        return (
+            f"This person is moving into {g('target', 'a new field')}. Rewrite each bullet so a hiring manager in that field "
+            "instantly sees the transferable value - use that field's vocabulary for the SAME facts. You may rephrase and "
+            "re-emphasize, but never add a responsibility, tool, number, title or outcome that isn't in the original. "
+            f"{_ANTI_FAB}\n\nBullets (one per line):\n{g('bullets')}\n\n"
+            "Return ONLY a JSON array - no prose, no code fence - with one object per bullet, in order: "
+            '[{"original": "the bullet as given", "translated": "the rewrite", "terms": ["field vocabulary you used"]}]'
+        )
+    if task == "resume_review":
+        # Scorecard: a recruiter's honest first-pass read of the whole resume.
+        resume = _clip(i.get("resume", ""), 9000)
+        return (
+            f"You are an experienced recruiter screening for: {g('target', 'the role this person is targeting')}. Give the honest "
+            f"first-pass read you'd give a friend. {_ANTI_FAB} Quote the resume exactly when you point at a line; never "
+            "invent experience they could add.\n\n"
+            f"RESUME:\n{resume}\n\n"
+            "Format exactly:\nVERDICT: <one line - would you call them, and why>\n"
+            "STRENGTHS:\n- <specific to this resume>\n- <...>\n- <...>\n"
+            "FIX FIRST:\n- <highest-impact change, quoting the exact line>\n- <...>\n- <...>\n"
+            "RISK: <one line - what a skeptical recruiter will question>"
+        )
     raise ValueError(f"unknown task: {task}")
  
  
@@ -257,6 +293,8 @@ ALLOWED_TASKS = {
     "role_prep", "salary_context",
     # Mission control read-out, Inbox triage, Explore directions, Resume import (free - Metis is free for every tier)
     "overview_briefing", "inbox_triage", "explore_directions", "resume_profile",
+    # Resume Studio (Workshop): Metric Miner/XYZ rewrite, Career-Switch Translator, recruiter review
+    "metric_bullet", "career_translate", "resume_review",
 }
  
 # The Job Search "AI Copilot" tools are a Pro feature. These tasks are gated
