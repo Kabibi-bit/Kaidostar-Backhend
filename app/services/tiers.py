@@ -89,6 +89,12 @@ FEATURE_DAILY_CAPS = {
     "metis-chat":         {"free": 25, "pro": 200, "max": 1000},
     "company-research":   {"free": 8,  "pro": 60,  "max": 1000},
     "interview-prep":     {"free": 5,  "pro": 50,  "max": 1000},
+    # Interview Studio (Interview Prep page - a Pro feature, so Free is 0 = gated).
+    # A spoken Hot Seat session is ~1 plan + 1 judged turn per answer (+ follow-ups) + 1 verdict.
+    "interview-plan":     {"free": 0,  "pro": 40,  "max": 1000},
+    "interview-turn":     {"free": 0,  "pro": 200, "max": 1000},
+    "interview-verdict":  {"free": 0,  "pro": 40,  "max": 1000},
+    "interview-coach":    {"free": 0,  "pro": 120, "max": 1000},
     "application-draft":  {"free": 8,  "pro": 60,  "max": 1000},
     "application-autosubmit": {"free": 0, "pro": 40, "max": 1000},  # 0 = gated (Pro+ feature): real browser auto-submission
     "explain-outcome":    {"free": 10, "pro": 80,  "max": 1000},
