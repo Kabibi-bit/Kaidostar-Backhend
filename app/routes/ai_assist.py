@@ -16,7 +16,7 @@ from app.db import get_db
 from app.models.db_models import Profile
 from app.services.auth import verify_token_belongs_to_user
 from app.services.ai_client import get_client
-from app.services.ai_assist import run_assist, ALLOWED_TASKS, COPILOT_TASKS
+from app.services.ai_assist import run_assist, ALLOWED_TASKS, COPILOT_TASKS, INTERVIEW_TASKS
 from app.services.rate_limit import rate_limit_by_tier
 from app.services.tiers import require_feature
  
@@ -60,6 +60,8 @@ def assist_route(payload: AssistIn, db: Session = Depends(get_db), authorization
         raise HTTPException(status_code=400, detail="unknown task")
     if payload.task in COPILOT_TASKS:
         require_feature(db, payload.user_id, "ai_copilot")  # ai_copilot is FREE (Job Search) - passes for every tier; kept as a defensive gate if it's ever re-tiered
+    if payload.task in INTERVIEW_TASKS:
+        require_feature(db, payload.user_id, "interview_prep")  # Interview Prep is Pro+: enforce it here, not just in the UI
     _bound_inputs(payload.inputs)
     rate_limit_by_tier(db, payload.user_id, "ai-assist", per_action_limit=400)
  
