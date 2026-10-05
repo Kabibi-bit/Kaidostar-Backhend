@@ -297,6 +297,14 @@ ALLOWED_TASKS = {
     "metric_bullet", "career_translate", "resume_review",
 }
  
+# The Interview Prep coaching tasks belong to a Pro feature (interview_prep).
+# Gated server-side like the page itself, so a Free account can't reach them by
+# calling the generic endpoint directly.
+INTERVIEW_TASKS = {
+    "answer_feedback", "tmays", "role_questions", "behavioral_story", "weakness_frame", "why_us",
+    "post_interview_debrief",
+}
+ 
 # The Job Search "AI Copilot" tools are a Pro feature. These tasks are gated
 # server-side by the ai_copilot flag so a Free account can't reach them by
 # calling the generic endpoint directly (the UI panel is gated too).
@@ -317,4 +325,3 @@ def run_assist(anthropic_client, task: str, inputs: dict, profile: dict) -> str:
     if not text:
         raise ValueError("empty AI response")
     return text
- 
