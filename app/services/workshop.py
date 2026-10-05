@@ -27,8 +27,9 @@ router = APIRouter(prefix="/workshop", tags=["workshop"])
 ALLOWED_KINDS = {
     "star_story", "reference", "contact", "portfolio",
     "achievement", "target_role", "pitch",
-    # Interview Prep page:
-    "interview_answer", "interview_ask",
+    # Interview Prep page (Interview Studio): drafted answers, questions to ask,
+    # judged Hot Seat sessions, and real-interview debriefs.
+    "interview_answer", "interview_ask", "interview_session", "interview_debrief",
     # Resume Studio: saved resume versions (snapshot + which applications it went to)
     "resume_version",
 }
