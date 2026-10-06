@@ -103,6 +103,149 @@ def _embed_listing(title: str, description: str, tags: list[str]) -> list[float]
     return generate_embedding(text, input_type="document")
  
  
+def _v2_fields(db: Session, item: dict) -> dict:
+    """Job Search v2 columns for a NEW listing row: the employer's own posting
+    date, pay and job type when the source gives them, when we saw it, and the
+    company|title|place key that lets a quiet repost be recognised. Every
+    field falls back to None/0 - never a guess."""
+    key, reposts = None, 0
+    try:
+        from app.services.job_search import canonical_key_for, repost_count_for
+        key = canonical_key_for(item)
+        reposts = repost_count_for(db, key, item.get("posted_at"), item.get("source"), item.get("external_id"))
+    except Exception as e:
+        print(f"  v2 listing fields skipped for '{item.get('title')}': {e}")
+    return {
+        "posted_at": item.get("posted_at"), "last_seen_at": utcnow(), "seen_count": 1, "repost_count": reposts,
+        "employment_type": item.get("employment_type"), "contract_type": item.get("contract_type"),
+        "category": item.get("category"), "canonical_key": key,
+        "salary_min": item.get("salary_min"), "salary_max": item.get("salary_max"), "salary_is_predicted": item.get("salary_is_predicted"),
+    }
+ 
+ 
+class _IngestPass:
+    """What one ingestion pass has handled so far: every (source, external id) -
+    the same Adzuna id can come back from two different queries in one pass - and
+    the stored listings that turned up again, marked live in one UPDATE after the
+    new rows commit (so a failed insert batch can never throw those away)."""
+    def __init__(self):
+        self.keys = set()
+        self.seen_now = {}   # listing id -> fields to fill in on rows stored before Job Search v2
+ 
+ 
+def _new_listing_problem(item) -> str | None:
+    """Why a normalized listing can't be stored, or None. Checked BEFORE the row
+    is added: one record without an apply link would otherwise fail the whole
+    batch commit."""
+    if not isinstance(item, dict):
+        return "not a listing record"
+    for f in ("source", "external_id", "title", "type", "apply_url"):
+        v = item.get(f)
+        if not isinstance(v, str) or not v.strip():
+            return "no " + f.replace("_", " ")
+    if not isinstance(item.get("org"), str):
+        return "no company field"
+    return None
+ 
+ 
+def _touch_seen(row, cycle, item=None) -> None:
+    """A listing we already have turned up again: it's still live at the source.
+    Rows stored before Job Search v2 also get the posting date, job type and
+    repost key the source gives now - otherwise they'd say "date unknown" forever."""
+    try:
+        fill = cycle.seen_now.get(row.id) or {}
+        if isinstance(item, dict):
+            if getattr(row, "posted_at", None) is None and item.get("posted_at") is not None:
+                fill["posted_at"] = item["posted_at"]
+            if getattr(row, "employment_type", None) is None and item.get("employment_type"):
+                fill["employment_type"] = item["employment_type"]
+            if getattr(row, "contract_type", None) is None and item.get("contract_type"):
+                fill["contract_type"] = item["contract_type"]
+            if getattr(row, "canonical_key", None) is None and "canonical_key" not in fill:
+                from app.services.job_search import canonical_key_for
+                key = canonical_key_for(item)
+                if key:
+                    fill["canonical_key"] = key
+        cycle.seen_now[row.id] = fill
+    except Exception:
+        pass
+ 
+ 
+def _skip_or_touch(db: Session, cycle, item) -> bool:
+    """True when this item needs no new row: already handled in this pass,
+    unstorable (logged), or already stored - then it's recorded as live again."""
+    if not isinstance(item, dict):
+        return True
+    key = (item.get("source"), item.get("external_id"))
+    if key in cycle.keys:
+        return True
+    problem = _new_listing_problem(item)
+    exists = None
+    if item.get("source") and item.get("external_id"):
+        exists = (
+            db.query(Listing)
+            .filter(Listing.source == item["source"], Listing.external_id == item["external_id"])
+            .first()
+        )
+    if exists:
+        cycle.keys.add(key)
+        _touch_seen(exists, cycle, item)
+        return True
+    if problem:
+        # not remembered as handled: a later, valid copy of the same posting in this pass can still be stored
+        print(f"  Skipped a listing that can't be stored ({problem}): source={item.get('source')}, ext={item.get('external_id')}")
+        return True
+    cycle.keys.add(key)
+    return False
+ 
+ 
+def _add_listing(db: Session, item: dict, tags) -> int:
+    db.add(Listing(
+        source=item["source"], external_id=item["external_id"], title=item["title"],
+        org=item["org"], type=item["type"], location=item["location"],
+        description=item["description"], tags=tags, deadline=item["deadline"],
+        apply_url=item["apply_url"],
+        embedding=_embed_listing(item["title"], item["description"], tags),
+        **_v2_fields(db, item),
+    ))
+    return 1
+ 
+ 
+def _apply_seen(db: Session, cycle) -> int:
+    """Marks every listing that turned up again as still live - bulk UPDATEs
+    after the inserts commit - and fills in what pre-v2 rows were missing."""
+    ids = list(cycle.seen_now)
+    if not ids:
+        return 0
+    try:
+        from sqlalchemy import func
+        now = utcnow()
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            db.query(Listing).filter(Listing.id.in_(chunk)).update(
+                {Listing.last_seen_at: now, Listing.seen_count: func.coalesce(Listing.seen_count, 1) + 1},
+                synchronize_session=False)
+        for lid, fill in cycle.seen_now.items():
+            if fill:
+                db.query(Listing).filter(Listing.id == lid).update(fill, synchronize_session=False)
+        db.commit()
+        return len(ids)
+    except Exception as e:
+        db.rollback()
+        print(f"Marking re-seen listings as live failed (non-fatal): {e}")
+        return 0
+ 
+ 
+def _safe_normalize(fn, raw):
+    """One malformed record from a source must not cost the whole source's batch
+    (or, uncaught, the whole day's scan)."""
+    try:
+        return fn(raw)
+    except Exception as e:
+        print(f"  Skipped a malformed record from {getattr(fn, '__name__', 'a source')}: {e}")
+        return None
+ 
+ 
 def backfill_missing_embeddings(db: Session, batch_size: int = 100) -> dict:
     """Any listing ingested before VOYAGE_API_KEY was configured has
     embedding=None permanently - the ingestion upsert above (`if
@@ -161,6 +304,7 @@ async def _pull_and_store_new_listings(db: Session):
     """
     anthropic_client = get_client()  # None if no API key; extract_tags degrades to []
     stored_count = 0
+    cycle = _IngestPass()
     total_possible_queries = len(JOB_SEARCH_QUERIES) + len(ATHLETIC_CAREER_QUERIES) + len(ADMISSIONS_OPPORTUNITY_QUERIES)
     reserved_calls = check_and_reserve_quota(db, "adzuna", calls_needed=total_possible_queries, daily_limit=ADZUNA_DAILY_CALL_LIMIT)
     # Proportional split, not a hard job-queries-first priority - direct
@@ -202,49 +346,25 @@ async def _pull_and_store_new_listings(db: Session):
             all_adzuna_raw.extend(await fetch_adzuna(q))
         except Exception as e:
             print(f"  Adzuna query '{q}' failed, skipping it for today: {e}")
-    adzuna_normalized = dedupe_listings([normalize_adzuna(r) for r in all_adzuna_raw])
+    adzuna_normalized = dedupe_listings([_safe_normalize(normalize_adzuna, r) for r in all_adzuna_raw])
     for item in adzuna_normalized:
-        exists = (
-            db.query(Listing)
-            .filter(Listing.source == item["source"], Listing.external_id == item["external_id"])
-            .first()
-        )
-        if exists:
+        if _skip_or_touch(db, cycle, item):
             continue
         try:
             tags = await extract_tags(item["description"], anthropic_client)
         except Exception as e:
             print(f"  Tag extraction failed for '{item['title']}', storing with no tags rather than losing it: {e}")
             tags = []
-        db.add(Listing(
-            source=item["source"], external_id=item["external_id"], title=item["title"],
-            org=item["org"], type=item["type"], location=item["location"],
-            description=item["description"], tags=tags, deadline=item["deadline"],
-            apply_url=item["apply_url"],
-            embedding=_embed_listing(item["title"], item["description"], tags),
-        ))
-        stored_count += 1
+        stored_count += _add_listing(db, item, tags)
  
     # Source 2: SimplifyJobs, for internships - free, no Claude call
     try:
         markdown_text = await fetch_simplify_internships()
         simplify_listings = parse_simplify_markdown(markdown_text)
         for item in simplify_listings:
-            exists = (
-                db.query(Listing)
-                .filter(Listing.source == item["source"], Listing.external_id == item["external_id"])
-                .first()
-            )
-            if exists:
+            if _skip_or_touch(db, cycle, item):
                 continue
-            db.add(Listing(
-                source=item["source"], external_id=item["external_id"], title=item["title"],
-                org=item["org"], type=item["type"], location=item["location"],
-                description=item["description"], tags=item["tags"], deadline=item["deadline"],
-                apply_url=item["apply_url"],
-                embedding=_embed_listing(item["title"], item["description"], item["tags"]),
-            ))
-            stored_count += 1
+            stored_count += _add_listing(db, item, item["tags"])
     except Exception as e:
         print(f"SimplifyJobs ingestion failed (non-fatal, Adzuna results still saved): {e}")
  
@@ -275,24 +395,12 @@ async def _pull_and_store_new_listings(db: Session):
                 accepted_raw.append(r)
             else:
                 print(f"Scholarship quality gate rejected \"{r.get('title', '(no title)')}\": {reason}")
-        scholarship_normalized = [normalize_scholarship_from_search(r) for r in accepted_raw]
+        scholarship_normalized = [_safe_normalize(normalize_scholarship_from_search, r) for r in accepted_raw]
         scholarship_normalized = dedupe_listings([r for r in scholarship_normalized if r is not None])
         for item in scholarship_normalized:
-            exists = (
-                db.query(Listing)
-                .filter(Listing.source == item["source"], Listing.external_id == item["external_id"])
-                .first()
-            )
-            if exists:
+            if _skip_or_touch(db, cycle, item):
                 continue
-            db.add(Listing(
-                source=item["source"], external_id=item["external_id"], title=item["title"],
-                org=item["org"], type=item["type"], location=item["location"],
-                description=item["description"], tags=item["tags"], deadline=item["deadline"],
-                apply_url=item["apply_url"],
-                embedding=_embed_listing(item["title"], item["description"], item["tags"]),
-            ))
-            stored_count += 1
+            stored_count += _add_listing(db, item, item["tags"])
     except Exception as e:
         print(f"Scholarship discovery failed (non-fatal): {e}")
  
@@ -303,14 +411,9 @@ async def _pull_and_store_new_listings(db: Session):
     # which doesn't exist as a free public service.
     try:
         raw_athletic = await fetch_athletic_career_jobs(max_queries=athletic_query_budget)
-        athletic_normalized = dedupe_listings([normalize_athletic_job(r) for r in raw_athletic])
+        athletic_normalized = dedupe_listings([_safe_normalize(normalize_athletic_job, r) for r in raw_athletic])
         for item in athletic_normalized:
-            exists = (
-                db.query(Listing)
-                .filter(Listing.source == item["source"], Listing.external_id == item["external_id"])
-                .first()
-            )
-            if exists:
+            if _skip_or_touch(db, cycle, item):
                 continue
             try:
                 tags = await extract_tags(item["description"], anthropic_client)
@@ -318,14 +421,7 @@ async def _pull_and_store_new_listings(db: Session):
                 print(f"  Tag extraction failed for '{item['title']}', storing with no tags rather than losing it: {e}")
                 tags = []
             tags = list(set(tags + ["athletics"]))  # ensure it's always discoverable by the athletics filter
-            db.add(Listing(
-                source=item["source"], external_id=item["external_id"], title=item["title"],
-                org=item["org"], type=item["type"], location=item["location"],
-                description=item["description"], tags=tags, deadline=item["deadline"],
-                apply_url=item["apply_url"],
-                embedding=_embed_listing(item["title"], item["description"], tags),
-            ))
-            stored_count += 1
+            stored_count += _add_listing(db, item, tags)
     except Exception as e:
         print(f"Athletic-career job ingestion failed (non-fatal): {e}")
  
@@ -336,14 +432,9 @@ async def _pull_and_store_new_listings(db: Session):
     # mirroring the athletic source above.
     try:
         raw_admissions = await fetch_admissions_opportunities(max_queries=admissions_query_budget)
-        admissions_normalized = dedupe_listings([normalize_admissions_opportunity(r) for r in raw_admissions])
+        admissions_normalized = dedupe_listings([_safe_normalize(normalize_admissions_opportunity, r) for r in raw_admissions])
         for item in admissions_normalized:
-            exists = (
-                db.query(Listing)
-                .filter(Listing.source == item["source"], Listing.external_id == item["external_id"])
-                .first()
-            )
-            if exists:
+            if _skip_or_touch(db, cycle, item):
                 continue
             try:
                 tags = await extract_tags(item["description"], anthropic_client)
@@ -351,14 +442,7 @@ async def _pull_and_store_new_listings(db: Session):
                 print(f"  Tag extraction failed for '{item['title']}', storing with no tags rather than losing it: {e}")
                 tags = []
             tags = list(set(tags + ["admissions"]))  # ensure it's always discoverable by the admissions filter
-            db.add(Listing(
-                source=item["source"], external_id=item["external_id"], title=item["title"],
-                org=item["org"], type=item["type"], location=item["location"],
-                description=item["description"], tags=tags, deadline=item["deadline"],
-                apply_url=item["apply_url"],
-                embedding=_embed_listing(item["title"], item["description"], tags),
-            ))
-            stored_count += 1
+            stored_count += _add_listing(db, item, tags)
     except Exception as e:
         print(f"Admissions opportunity ingestion failed (non-fatal): {e}")
  
@@ -371,22 +455,10 @@ async def _pull_and_store_new_listings(db: Session):
     try:
         ncaa_programs = await fetch_ncaa_schools(limit=200)
         for item in ncaa_programs:
-            exists = (
-                db.query(Listing)
-                .filter(Listing.source == item["source"], Listing.external_id == item["external_id"])
-                .first()
-            )
-            if exists:
+            if _skip_or_touch(db, cycle, item):
                 continue
             tags = list(set((item.get("tags") or []) + ["athletic"]))  # always discoverable by the athletic filter
-            db.add(Listing(
-                source=item["source"], external_id=item["external_id"], title=item["title"],
-                org=item["org"], type=item["type"], location=item["location"],
-                description=item["description"], tags=tags, deadline=item["deadline"],
-                apply_url=item["apply_url"],
-                embedding=_embed_listing(item["title"], item["description"], tags),
-            ))
-            stored_count += 1
+            stored_count += _add_listing(db, item, tags)
     except Exception as e:
         print(f"NCAA target-program ingestion failed (non-fatal): {e}")
  
@@ -407,6 +479,9 @@ async def _pull_and_store_new_listings(db: Session):
             "source": o.source, "external_id": o.external_id, "title": o.title, "org": o.org,
             "type": o.type, "location": o.location, "description": o.description, "tags": o.tags,
             "deadline": o.deadline, "apply_url": o.apply_url, "embedding": o.embedding,
+            "salary_min": o.salary_min, "salary_max": o.salary_max, "salary_is_predicted": o.salary_is_predicted,
+            "posted_at": o.posted_at, "last_seen_at": o.last_seen_at, "seen_count": o.seen_count, "repost_count": o.repost_count,
+            "employment_type": o.employment_type, "contract_type": o.contract_type, "category": o.category, "canonical_key": o.canonical_key,
         } for o in pending]
         db.rollback()
         saved = 0
@@ -419,6 +494,7 @@ async def _pull_and_store_new_listings(db: Session):
                 db.rollback()
                 print(f"  Skipped a bad listing row (source={row.get('source')}, ext={row.get('external_id')}): {row_err}")
         stored_count = saved
+    _apply_seen(db, cycle)
     return stored_count
  
  
@@ -482,8 +558,13 @@ def run_scan_for_all_users():
     db = SessionLocal()
     try:
         print(f"[{utcnow().isoformat()}] Starting daily scan...")
-        new_count = asyncio.run(_pull_and_store_new_listings(db))
-        print(f"Pulled {new_count} new listings.")
+        try:
+            new_count = asyncio.run(_pull_and_store_new_listings(db))
+            print(f"Pulled {new_count} new listings.")
+        except Exception as e:
+            # a failed pull must not cancel rescoring, Auto, alerts or auto-send for everyone
+            db.rollback()
+            print(f"Pulling new listings failed (non-fatal - scoring what we have): {e}")
  
         # Runs automatically every day rather than depending on a
         # human remembering the manual /system/backfill-embeddings
@@ -523,7 +604,19 @@ def run_scan_for_all_users():
         # Load the listing set once per cycle - it's identical for every
         # user in this pass, so re-querying it inside the loop was N
         # redundant full-table loads. Fetched here and reused below.
-        all_listings_this_cycle = db.query(Listing).all()
+        # Turned into plain dicts right away: ORM rows expire at every commit inside
+        # the loop below, and re-reading them would mean one query per listing per user.
+        all_listing_dicts_this_cycle = [_listing_to_dict(l) for l in db.query(Listing).all()]
+        # The Job Search v2 pool (jobs/internships/programs, newest first) - also
+        # built once, as engine-ready dicts, and shared by every user's Auto pass
+        # and saved-search alerts.
+        try:
+            from app.services.job_search import pool_dicts
+            v2_pool_this_cycle = pool_dicts(db)
+        except Exception as e:
+            db.rollback()
+            print(f"Job Search v2 pool unavailable this cycle (Auto and alerts will skip): {e}")
+            v2_pool_this_cycle = None
         for user in users:
             # Isolated per-user, mirroring the exact same defensive
             # pattern already applied consistently everywhere else in
@@ -547,10 +640,25 @@ def run_scan_for_all_users():
                     .first()
                 )
                 if profile and profile.auto_apply_enabled:
-                    listings = all_listings_this_cycle
-                    from app.models.db_models import DismissedListing
-                    dismissed_ids = {str(row.listing_id) for row in db.query(DismissedListing).filter(DismissedListing.user_id == user.id).all()}
-                    ranked = rank_listings([_listing_to_dict(l) for l in listings], _profile_to_dict(profile), top_n=10, dismissed_ids=dismissed_ids)
+                    # Auto acts on the user's own Job Search v2 matches: the same honest
+                    # fit they see on each card, and every Job Search dealbreaker they set
+                    # (hidden companies, sponsorship conflicts, pay floors on Hide...) binds
+                    # Auto too. If v2 can't run, Auto does nothing this cycle rather than
+                    # fall back to a different scoring scale.
+                    if getattr(profile, "is_athlete", False):
+                        # athletes' listings (athletic programs, coaching jobs) aren't in the
+                        # Job Search pool - they keep the athletics ranking they always had
+                        from app.models.db_models import DismissedListing
+                        dismissed_ids = {str(row.listing_id) for row in db.query(DismissedListing).filter(DismissedListing.user_id == user.id).all()}
+                        ranked = rank_listings(all_listing_dicts_this_cycle, _profile_to_dict(profile), top_n=10, dismissed_ids=dismissed_ids)
+                    else:
+                        try:
+                            from app.services.job_search import auto_candidates
+                            ranked = auto_candidates(db, str(user.id), profile, rows=v2_pool_this_cycle) if v2_pool_this_cycle is not None else []
+                        except Exception as e:
+                            db.rollback()
+                            print(f"    Auto skipped for {user.email}: v2 matching failed ({e})")
+                            ranked = []
  
                     # ONE shared autonomous pass - the same helper the manual /scan
                     # endpoint uses, so the two can't drift. It enforces the user's
@@ -597,6 +705,19 @@ def run_scan_for_all_users():
                         # work above was already committed inside create_application_for_match).
                         db.rollback()
                         print(f"    Notification write failed (non-fatal): {e}")
+ 
+                # Saved-search alerts (Job Search v2): new strong matches for any saved
+                # search with alerts on go to the Inbox - once per job, shared with the
+                # browser's own alert check so nobody is told twice.
+                if profile and not getattr(profile, "is_athlete", False) and v2_pool_this_cycle is not None:
+                    try:
+                        from app.services.job_search import run_saved_search_alerts
+                        n_alerts = run_saved_search_alerts(db, str(user.id), profile, rows=v2_pool_this_cycle)
+                        if n_alerts:
+                            print(f"    Saved-search alerts: {n_alerts} new strong match(es) for {user.email}")
+                    except Exception as e:
+                        db.rollback()
+                        print(f"    Saved-search alerts skipped (non-fatal): {e}")
  
                 # Weekly digest: at most once per 7 days per user, only when there's
                 # something real to say, respecting the mute preference. Fully
@@ -680,7 +801,7 @@ def run_scan_for_all_users():
                     listing = db.query(Listing).filter(Listing.id == app_record.listing_id).first()
                     if not listing:
                         continue
-                    res = deliver_accepted_application(db, app_record, listing, anthropic_client)
+                    res = deliver_accepted_application(db, app_record, listing, anthropic_client, unattended=True)
                     uid = app_record.user_id
                     if res.get("status") == "sent":
                         sent_counts_by_user[uid] = sent_counts_by_user.get(uid, 0) + 1
