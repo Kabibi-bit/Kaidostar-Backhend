@@ -120,7 +120,7 @@ def _require_autosubmit_access(db, app_record):
         )
  
  
-def deliver_accepted_application(db, app_record, listing, client=None):
+def deliver_accepted_application(db, app_record, listing, client=None, unattended: bool = False):
     """The single REAL delivery path for an accepted application, shared by the
     manual /send route AND the scheduler's unattended auto-send, so both deliver
     identically and NEITHER ever marks an application 'sent' without a real send.
@@ -136,11 +136,26 @@ def deliver_accepted_application(db, app_record, listing, client=None):
     Mutates app_record and commits, and returns the same result dict the route
     returns. Meters the paid Metis call and the auto-submit so the scheduler's bulk
     path is bounded exactly like the manual one. Never raises for a delivery outcome
-    - a blocker or failure becomes a hand-off, not an exception."""
+    - a blocker or failure becomes a hand-off, not an exception.
+ 
+    unattended=True (the scheduler's auto-send): a listing that was added by hand
+    rather than pulled from a job source is never emailed or auto-submitted - its
+    contact address and form weren't vetted by any source, so the person submits it."""
     from app.services.tiers import tier_has_feature, get_user_tier
     from app.services.email_send import send_email
     from app.models.db_models import Profile as Profile_
     from app.services.application_submit import submit_application_via_browser
+    from app.services.job_search import HAND_ADDED_SOURCES
+ 
+    if unattended and (getattr(listing, "source", None) or "") in HAND_ADDED_SOURCES:
+        app_record.status = "ready_to_submit"
+        app_record.sent_channel = "web"
+        db.commit()
+        return {
+            "status": "ready_to_submit", "channel": "web",
+            "apply_url": listing.apply_url, "draft_content": app_record.draft_content,
+            "reasoning": "This listing was added by hand rather than found by a job source, so Kaidostar doesn't send it for you - submit it at the posting.",
+        }
  
     # This function owns the paid work (the Metis channel call, the auto-submit) AND
     # its metering, so callers just hand it the application - they don't fetch a
@@ -261,6 +276,26 @@ router = APIRouter(prefix="/applications", tags=["applications"])
 class AcceptIn(BaseModel):
     user_id: str
     listing_id: str
+    # The Job Search page's "Draft application" button: write the draft, never approve
+    # it - the user reviews it first, whatever its fit. (Starring and "accept" keep the
+    # one-click behaviour: approved when the fit clears the user's threshold.)
+    draft_only: bool = False
+ 
+ 
+def _v2_fit_or_none(db, user_id, listing_id):
+    """The Job Search v2 fit for this listing - the number the user saw on the
+    card - so the auto-approve threshold judges the same score. None (fall back
+    to the older score) if the listing or profile can't be scored."""
+    try:
+        from app.models.db_models import Profile, Listing
+        from app.services.job_search import v2_fit_for_listing
+        profile = db.query(Profile).filter(Profile.user_id == user_id, Profile.is_current == True).first()  # noqa: E712
+        listing = db.query(Listing).filter(Listing.id == listing_id).first()
+        if profile is None or listing is None or getattr(profile, "is_athlete", False):
+            return None
+        return v2_fit_for_listing(db, user_id, profile, listing)
+    except Exception:
+        return None
  
  
 @router.post("/accept")
@@ -289,7 +324,8 @@ def accept_match(payload: AcceptIn, db: Session = Depends(get_db), authorization
     # action, so the highest-traffic gap). Matches the sibling /draft route's cap.
     # Fails open.
     rate_limit_by_tier(db, payload.user_id, "application-draft", per_action_limit=200)
-    result = create_application_for_match(db, client, payload.user_id, payload.listing_id)
+    result = create_application_for_match(db, client, payload.user_id, payload.listing_id, fit_override=_v2_fit_or_none(db, payload.user_id, payload.listing_id),
+                                          mode="draft_only" if getattr(payload, "draft_only", False) is True else None)
  
     if result.get("error") == "no_profile":
         raise HTTPException(status_code=404, detail="No current profile for this user")
