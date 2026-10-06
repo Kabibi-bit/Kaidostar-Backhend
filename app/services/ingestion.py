@@ -8,7 +8,7 @@ import re
 import html
 import hashlib
 import httpx
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
  
 ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID")
 ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY")
@@ -108,6 +108,40 @@ async def fetch_adzuna(query: str, location: str = "us", page: int = 1) -> list[
         return []
  
  
+_ISO_DT = re.compile(r"^([0-9]{4})-([0-9]{2})-([0-9]{2})(?:[T ]([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.[0-9]+)?)?)?\s*(Z|[+-][0-9]{2}:?[0-9]{2})?$")
+ 
+ 
+def parse_source_datetime(value):
+    """An ISO-8601 timestamp from a job source (Adzuna's "created") as a naive
+    UTC datetime - the kind the listings table stores. Returns None for anything
+    that isn't a real, plausible date: a missing value, a number, garbage, or a
+    date in the future (a clock-skewed source must not make a job look newer
+    than it is)."""
+    if not isinstance(value, str):
+        return None
+    m = _ISO_DT.match(value.strip())
+    if not m:
+        return None
+    try:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        hh, mi, ss = int(m.group(4) or 0), int(m.group(5) or 0), int(m.group(6) or 0)
+        dt = datetime(y, mo, d, hh, mi, min(ss, 59))
+    except (ValueError, OverflowError):
+        return None
+    tz = m.group(7)
+    if tz and tz != "Z":
+        sign = -1 if tz[0] == "-" else 1
+        digits = tz[1:].replace(":", "")
+        try:
+            dt = dt - sign * timedelta(hours=int(digits[:2]), minutes=int(digits[2:4]))
+        except (ValueError, OverflowError):   # "0001-01-01T00:00:00+05:00" runs off the calendar
+            return None
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if dt.year < 2000 or (dt - now).total_seconds() > 86400:
+        return None
+    return dt
+ 
+ 
 def normalize_adzuna(raw: dict) -> dict | None:
     """HTML-entity decoding on title/org/description - found by
     stress-testing against realistic messy data rather than clean
@@ -147,9 +181,18 @@ def normalize_adzuna(raw: dict) -> dict | None:
         salary_min = None
         salary_max = None
         salary_is_predicted = None
+    # Job Search v2: the employer's own posting date and the job's type, when
+    # Adzuna reports them. Anything unexpected becomes None - never a guess.
+    contract_time = str(raw.get("contract_time") or "").strip().lower()
+    contract_type = str(raw.get("contract_type") or "").strip().lower()
+    category = raw.get("category") if isinstance(raw.get("category"), dict) else {}
     return {
         "source": "adzuna",
         "external_id": external_id,
+        "posted_at": parse_source_datetime(raw.get("created")),
+        "employment_type": contract_time if contract_time in ("full_time", "part_time") else None,
+        "contract_type": contract_type if contract_type in ("permanent", "contract") else None,
+        "category": (str(category.get("label") or "").strip()[:120] or None),
         "title": html.unescape(str(raw.get("title") or "")).strip(),
         "org": html.unescape(str((raw.get("company") if isinstance(raw.get("company"), dict) else {}).get("display_name") or "Unknown")),
         "type": "job",  # Adzuna doesn't distinguish internships; refine via title keywords
