@@ -338,13 +338,18 @@ def decide_sendable_at(status: str, autonomous: bool):
     return utcnow() if autonomous else compute_sendable_at()
  
  
-def create_application_for_match(db, anthropic_client, user_id: str, listing_id: str, auto_generated: bool = False, mode: str | None = None):
+def create_application_for_match(db, anthropic_client, user_id: str, listing_id: str, auto_generated: bool = False, mode: str | None = None, fit_override=None):
     """The actual 'accept a match -> draft an application' pipeline,
     shared by the explicit /applications/accept endpoint, the automatic
     trigger when a user stars a listing, and the fully-autonomous Auto
     Apply mode (auto_generated=True) that runs against every eligible
     match in a scan without any manual action. Returns a dict describing
     the result, or a dict with an 'error' key if it couldn't run.
+ 
+    fit_override: the Job Search v2 fit for this listing (what the user sees
+    on the card). When given, it - not the older score - decides whether the
+    draft clears the user's auto-approve threshold, so "80" means the same
+    thing on the Job Search page, the Auto page and here.
     """
     from app.models.db_models import Profile, Listing, Application, RoadmapMilestone, Outcome, ResumeEntry
     from app.services.matching import score_listing, get_personalized_factor_weights
@@ -366,7 +371,11 @@ def create_application_for_match(db, anthropic_client, user_id: str, listing_id:
         .filter(Application.user_id == user_id, Application.listing_id == listing_id)
         .first()
     )
-    if existing:
+    # An application the user discarded ("undone", never sent) is re-opened when THEY ask for
+    # it again (a fresh draft, re-decided) - there can be only one row per job, so answering
+    # "you already have one" would leave a dead end. Auto never re-opens it.
+    reopen = existing if (existing is not None and existing.status == "undone" and not auto_generated) else None
+    if existing and reopen is None:
         return {
             "application_id": str(existing.id),
             "status": existing.status,
@@ -437,7 +446,13 @@ def create_application_for_match(db, anthropic_client, user_id: str, listing_id:
     # flat +8 on top of a score_pct that never reflected roadmap
     # alignment at all; keeping that bonus now that score_pct
     # genuinely includes it would double-count the same signal.
-    composite_confidence = compute_composite_confidence(match["score_pct"])
+    v2_fit = None
+    if fit_override is not None and not isinstance(fit_override, bool):
+        try:
+            v2_fit = max(0, min(100, int(round(float(fit_override)))))
+        except (TypeError, ValueError):
+            v2_fit = None
+    composite_confidence = compute_composite_confidence(v2_fit if v2_fit is not None else match["score_pct"])
     counterfactual_confidence = compute_composite_confidence(match_no_personalization["score_pct"])
  
     resume_entry_rows = db.query(ResumeEntry).filter(ResumeEntry.user_id == user_id).all()
@@ -459,6 +474,32 @@ def create_application_for_match(db, anthropic_client, user_id: str, listing_id:
     # own and can't drift from what the scan and the tests assume.
     status = effective_status(status, mode, autonomous)
     sendable_at = decide_sendable_at(status, autonomous)
+ 
+    if reopen is not None:
+        reopen.draft_content = draft_text
+        reopen.confidence_pct = composite_confidence
+        reopen.status = status
+        reopen.sendable_at = sendable_at
+        reopen.auto_generated = False
+        reopen.factors_snapshot = {**match["factors"], "signal_strength": match["signal_strength"], "factors_engaged": match["factors_engaged"], "data_quality": match.get("data_quality")}
+        reopen.counterfactual_confidence_pct = counterfactual_confidence
+        reopen.draft_flagged_terms = draft_result["flagged_terms"]
+        for attr in ("sent_at", "sent_channel", "sent_to_address"):
+            if hasattr(reopen, attr):
+                setattr(reopen, attr, None)
+        db.commit()
+        return {
+            "application_id": str(reopen.id),
+            "match_score": v2_fit if v2_fit is not None else match["score_pct"],
+            "roadmap_aligned": match["factors"].get("roadmap_alignment") is not None,
+            "composite_confidence": composite_confidence,
+            "status": status,
+            "draft": draft_text,
+            "review_note": "This draft includes a number or timing claim that wasn't in the job posting or your profile - double check it before sending." if draft_result["flagged_terms"] else None,
+            "already_existed": False,
+            "reopened": True,
+            "auto_generated": False,
+        }
  
     app_record = Application(
         user_id=user_id,
@@ -494,7 +535,7 @@ def create_application_for_match(db, anthropic_client, user_id: str, listing_id:
  
     return {
         "application_id": str(app_record.id),
-        "match_score": match["score_pct"],
+        "match_score": v2_fit if v2_fit is not None else match["score_pct"],
         "roadmap_aligned": match["factors"].get("roadmap_alignment") is not None,
         "composite_confidence": composite_confidence,
         "status": status,
@@ -800,7 +841,7 @@ def auto_apply_and_outreach_for_user(db, anthropic_client, user_id, profile, ran
     for chosen in selection["to_apply"]:
         listing = chosen["item"]
         try:
-            outcome = create_application_for_match(db, anthropic_client, str(user_id), listing["id"], auto_generated=True, mode=mode)
+            outcome = create_application_for_match(db, anthropic_client, str(user_id), listing["id"], auto_generated=True, mode=mode, fit_override=listing.get("v2_fit"))
             if not outcome.get("error") and not outcome.get("already_existed") and outcome.get("status") == "approved":
                 applied.append({
                     "listing_id": listing["id"],
