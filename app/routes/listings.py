@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends
 import logging
+import threading
 from app.services.auth import require_auth_for_user
 from app.services.ai_client import get_client
 from app.services.tiers import require_feature
@@ -14,6 +15,29 @@ from app.services.matching import rank_listings, rank_listings_with_near_misses,
  
 _log = logging.getLogger("kaidostar")
 router = APIRouter(prefix="/listings", tags=["listings"])
+ 
+# /listings/matches: pages ask for it a few times a day at most. Scoring a listings table is real
+# CPU work on the one process every request shares - so, on every branch: one computation per user
+# at a time, a few at once across everyone, and a daily ceiling far above what the pages need.
+MATCHES_DAILY_LIMIT = 120
+MATCHES_AT_ONCE = 2
+LEGACY_MATCH_LIMIT = 2000           # the original ranking reads the newest listings, never the whole table
+_MATCHES_SLOTS = threading.BoundedSemaphore(MATCHES_AT_ONCE)
+_V2_IN_FLIGHT = set()
+_V2_LOCK = threading.Lock()
+ 
+ 
+def _v2_begin(user_id) -> bool:
+    with _V2_LOCK:
+        if str(user_id) in _V2_IN_FLIGHT:
+            return False
+        _V2_IN_FLIGHT.add(str(user_id))
+        return True
+ 
+ 
+def _v2_end(user_id):
+    with _V2_LOCK:
+        _V2_IN_FLIGHT.discard(str(user_id))
  
  
 def _profile_to_dict(p: Profile) -> dict:
@@ -56,8 +80,50 @@ def _listing_to_dict(l: Listing) -> dict:
         "fetched_at": l.fetched_at.isoformat() if l.fetched_at else None,
     }
  
+@router.get("/pool/{user_id}")
+def get_pool(user_id: str, db: Session = Depends(get_db), _auth: dict = Depends(require_auth_for_user)):
+    """Job Search v2: everything the browser's Proof Match engine needs to
+    score this user's search on the device - the listing pool (jobs,
+    internships and programs, newest by the employer's own posting date,
+    never past their deadline), the user's dismissed and saved ids, their
+    resume entries, and their saved search state (preferences, learned
+    rules, saved searches). The server runs the identical engine for Auto
+    and alerts, so both sides agree on every score."""
+    import uuid as uuid_module
+    from datetime import datetime as _dt, timezone as _tz
+    from app.models.db_models import DismissedListing, SavedListing, ResumeEntry
+    from app.services import job_search as JSV
+    from app.services.job_engine import ENGINE_VERSION
+    try:
+        uuid_module.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="No current profile for this user")
+    listings = JSV.pool_dicts(db)
+    dismissed = sorted({str(r.listing_id) for r in db.query(DismissedListing).filter(DismissedListing.user_id == user_id).all()})
+    saved = sorted({str(r.listing_id) for r in db.query(SavedListing).filter(SavedListing.user_id == user_id).all()})
+    applied = sorted(JSV.applied_listing_ids(db, user_id))
+    entries = JSV.entries_for_engine(db.query(ResumeEntry).filter(ResumeEntry.user_id == user_id).all())
+    state, state_ok = JSV.load_state_checked(db, user_id)
+    return {
+        "engine_version": ENGINE_VERSION,
+        "generated_at": _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "count": len(listings),
+        "truncated": len(listings) >= JSV.POOL_LIMIT,
+        "listings": listings,
+        "dismissed_ids": dismissed,
+        "saved_ids": saved,
+        # jobs with an application already (Auto's, or a draft you accepted): the page
+        # leaves them out of your feed, exactly as Auto and alerts do
+        "applied_ids": applied,
+        "entries": entries,
+        "state": (state or None) if state_ok else None,
+        # the saved settings couldn't be read just now (not "there are none"): the page keeps its copy and waits
+        "state_unavailable": not state_ok,
+    }
+ 
+ 
 @router.get("/matches/{user_id}")
-def get_matches(user_id: str, db: Session = Depends(get_db), _auth: dict = Depends(require_auth_for_user)):
+def get_matches(user_id: str, engine: str | None = None, db: Session = Depends(get_db), _auth: dict = Depends(require_auth_for_user)):
     """Returns the current top-ranked listings for a user, scored live
     against whatever's currently in the listings table. Roadmap
     alignment is a real, graded factor baked directly into the score
@@ -73,7 +139,23 @@ def get_matches(user_id: str, db: Session = Depends(get_db), _auth: dict = Depen
         uuid_module.UUID(user_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="No current profile for this user")
+    if not _v2_begin(user_id):
+        raise HTTPException(status_code=429, detail="Your matches are already being worked out - try again in a moment.")
+    try:
+        if not _MATCHES_SLOTS.acquire(timeout=20):
+            raise HTTPException(status_code=503, detail="Matching is busy right now - try again in a moment.")
+        try:
+            # counted only once the request is really going to run
+            from app.services.rate_limit import rate_limit
+            rate_limit(db, user_id, "listing-matches", limit_per_day=MATCHES_DAILY_LIMIT)
+            return _get_matches(user_id, engine, db)
+        finally:
+            _MATCHES_SLOTS.release()
+    finally:
+        _v2_end(user_id)
  
+ 
+def _get_matches(user_id: str, engine, db):
     profile = (
         db.query(Profile)
         .filter(Profile.user_id == user_id, Profile.is_current == True)  # noqa: E712
@@ -82,7 +164,24 @@ def get_matches(user_id: str, db: Session = Depends(get_db), _auth: dict = Depen
     if not profile:
         raise HTTPException(status_code=404, detail="No current profile for this user")
  
-    listings = db.query(Listing).all()
+    # Job Search v2 ("?engine=v2", what the web app asks for): the same honest
+    # Proof Match fit the Job Search page shows, in the shape older pages read.
+    # Athletes keep the athletics ranking. Any failure falls through to the
+    # original ranking below rather than returning nothing.
+    if engine == "v2" and not getattr(profile, "is_athlete", False):
+        try:
+            from app.services import job_search as JSV
+            # "top matches" are the best fits, whatever display sort the Job Search page uses
+            return JSV.v2_matches_payload(JSV.analyze_for_user(db, user_id, profile, best_first=True))
+        except Exception as e:
+            db.rollback()   # a failed query leaves the session unusable for the fallback below
+            _log.warning("v2 matches failed for %s, using the original ranking: %s", user_id, e)
+ 
+    try:
+        listings = db.query(Listing).order_by(Listing.fetched_at.desc()).limit(LEGACY_MATCH_LIMIT).all()
+    except Exception:
+        db.rollback()
+        listings = db.query(Listing).limit(LEGACY_MATCH_LIMIT).all()
     if not listings:
         return {"matches": [], "note": "No listings in the database yet - run a scan first."}
  
@@ -176,35 +275,55 @@ async def trigger_scan(user_id: str, db: Session = Depends(get_db), _auth: dict 
     # via GET matches), so this purely caps direct/abusive hammering of it.
     rate_limit_by_tier(db, user_id, "listing-scan", per_action_limit=50)
  
-    new_count = await _pull_and_store_new_listings(db)
-    result = run_scan_for_user(db, user_id)
-    result["new_listings_pulled"] = new_count
+    import asyncio
+    from starlette.concurrency import run_in_threadpool
+    # The pull makes blocking calls (tagging, embeddings, the database, parsing every
+    # new posting), so it runs on a worker thread with its own event loop - never on
+    # the loop every other request shares. The session is used by one thread at a time.
+    new_count = await run_in_threadpool(lambda: asyncio.run(_pull_and_store_new_listings(db)))
  
-    profile = (
-        db.query(Profile)
-        .filter(Profile.user_id == user_id, Profile.is_current == True)  # noqa: E712
-        .first()
-    )
-    auto_applied = []
-    auto_drafted_outreach = []
-    client = get_client()
-    if profile and profile.auto_apply_enabled and client is not None:
-        listings = db.query(Listing).all()
-        from app.models.db_models import DismissedListing
-        dismissed_ids = {str(row.listing_id) for row in db.query(DismissedListing).filter(DismissedListing.user_id == user_id).all()}
-        ranked = rank_listings([_listing_to_dict(l) for l in listings], _profile_to_dict(profile), top_n=10, dismissed_ids=dismissed_ids)
-        # Same shared autonomous pass as the nightly scheduler: it enforces the
-        # user's own acceptance rules + daily cap (the set the Auto page previews)
-        # so a manual "scan now" applies to exactly what the engine would apply to
-        # unattended - never bypassing the rules, which matters most once consent
-        # has removed the undo window. Each listing is isolated inside the helper.
-        summary = auto_apply_and_outreach_for_user(db, client, user_id, profile, ranked)
-        auto_applied = summary["applied"]
-        auto_drafted_outreach = summary["outreach"]
-    result["auto_applied"] = auto_applied
-    result["auto_drafted_outreach"] = auto_drafted_outreach
+    def _rescore_and_auto():
+        # Scoring 800 listings is real CPU work: it runs in the worker threadpool,
+        # never on the event loop every other request shares.
+        result = run_scan_for_user(db, user_id)
+        result["new_listings_pulled"] = new_count
+        profile = (
+            db.query(Profile)
+            .filter(Profile.user_id == user_id, Profile.is_current == True)  # noqa: E712
+            .first()
+        )
+        auto_applied = []
+        auto_drafted_outreach = []
+        client = get_client()
+        if profile and profile.auto_apply_enabled and client is not None:
+            if getattr(profile, "is_athlete", False):
+                listings = db.query(Listing).all()
+                from app.models.db_models import DismissedListing
+                dismissed_ids = {str(row.listing_id) for row in db.query(DismissedListing).filter(DismissedListing.user_id == user_id).all()}
+                ranked = rank_listings([_listing_to_dict(l) for l in listings], _profile_to_dict(profile), top_n=10, dismissed_ids=dismissed_ids)
+            else:
+                # Same as the nightly scan: Auto acts on the user's own Job Search v2
+                # matches (their honest fit, their dealbreakers) - or not at all.
+                try:
+                    from app.services.job_search import auto_candidates
+                    ranked = auto_candidates(db, user_id, profile)
+                except Exception as e:
+                    db.rollback()
+                    _log.warning("v2 auto candidates failed for %s: %s", user_id, e)
+                    ranked = []
+            # Same shared autonomous pass as the nightly scheduler: it enforces the
+            # user's own acceptance rules + daily cap (the set the Auto page previews)
+            # so a manual "scan now" applies to exactly what the engine would apply to
+            # unattended - never bypassing the rules, which matters most once consent
+            # has removed the undo window. Each listing is isolated inside the helper.
+            summary = auto_apply_and_outreach_for_user(db, client, user_id, profile, ranked)
+            auto_applied = summary["applied"]
+            auto_drafted_outreach = summary["outreach"]
+        result["auto_applied"] = auto_applied
+        result["auto_drafted_outreach"] = auto_drafted_outreach
+        return result
  
-    return result
+    return await run_in_threadpool(_rescore_and_auto)
  
  
 @router.get("/matches/{user_id}/explain/{listing_id}")
@@ -509,3 +628,4 @@ def send_outreach_email(user_id: str, listing_id: str, payload: SendOutreachIn, 
         _log.warning("Outreach email send failed - %s", error_detail)
         raise HTTPException(status_code=502, detail="Sending the email failed just now. Please try again.")
     return {"status": "sent", "to_address": payload.to_address}
+ 
