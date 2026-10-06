@@ -315,8 +315,15 @@ COPILOT_TASKS = {
 }
  
  
+DEMO_NOTE = ("\n\nNote: these listings are a demo set from fictional companies. Say so where it matters, and never "
+             "present any of these companies as a real employer.")
+ 
+ 
 def run_assist(anthropic_client, task: str, inputs: dict, profile: dict) -> str:
     prompt = _b(task, inputs or {}, profile or {})
+    # the Job Search page's demo set: the model is told the companies are fictional
+    if isinstance(inputs, dict) and inputs.get("demo") is True:
+        prompt += DEMO_NOTE
     resp = anthropic_client.messages.create(
         model=MODEL, max_tokens=1200,
         messages=[{"role": "user", "content": prompt}],
@@ -325,3 +332,4 @@ def run_assist(anthropic_client, task: str, inputs: dict, profile: dict) -> str:
     if not text:
         raise ValueError("empty AI response")
     return text
+ 
