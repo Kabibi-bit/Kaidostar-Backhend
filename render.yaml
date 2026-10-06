@@ -29,3 +29,8 @@ services:
         sync: false
       - key: SCAN_INTERVAL_MINUTES
         value: "1440"
+      # Comma-separated user ids allowed to add listings by hand (POST /listings/manual).
+      # Unset = nobody can; those listings reach every user's Job Search pool.
+      - key: KAIDOSTAR_ADMIN_USER_IDS
+        sync: false
+ 
