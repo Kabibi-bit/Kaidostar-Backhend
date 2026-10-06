@@ -7,8 +7,16 @@ real listings by hand for now, so the matching/roadmap/chatbot
 features can be tested against real admissions/fellowship data you
 enter yourself. A real pipeline here would mean either paying for a
 data license or building partnerships with individual programs.
+ 
+Who may add them: only the operators listed in KAIDOSTAR_ADMIN_USER_IDS
+(comma-separated user ids). A listing added here enters every user's Job
+Search pool, saved-search alerts and Auto, so it is never open to any
+signed-in account - and with the variable unset, nobody can add one.
+Even then, the scheduler never emails or auto-submits an application to
+a hand-added listing (see deliver_accepted_application).
 """
 import hashlib
+import os
  
 from fastapi import APIRouter, HTTPException, Depends
 from app.services.auth import require_valid_token
@@ -22,11 +30,26 @@ from app.models.db_models import Listing
  
 router = APIRouter(prefix="/listings/manual", tags=["listings"])
  
+# the listing types the product reads
+MANUAL_TYPES = {"job", "internship", "college", "scholarship", "fellowship", "athletic"}
+MANUAL_DAILY_LIMIT = 200
+ 
+ 
+def admin_user_ids() -> set:
+    return {x.strip() for x in os.getenv("KAIDOSTAR_ADMIN_USER_IDS", "").split(",") if x.strip()}
+ 
+ 
+def require_admin(auth: dict = Depends(require_valid_token)) -> dict:
+    """A valid token whose user is one of the operators in KAIDOSTAR_ADMIN_USER_IDS."""
+    if str(auth.get("sub") or "") not in admin_user_ids():
+        raise HTTPException(status_code=403, detail="Adding listings by hand is limited to Kaidostar operators.")
+    return auth
+ 
  
 class ManualListingIn(BaseModel):
     title: str = Field(max_length=300)
     org: str = Field(max_length=300)
-    type: str = Field(max_length=50)  # "college" or "internship" typically, for this route
+    type: str = Field(max_length=50)  # one of MANUAL_TYPES ("college" or "internship" typically, for this route)
     location: str | None = Field(default=None, max_length=300)
     description: str | None = Field(default=None, max_length=10000)
     tags: list[str] = Field(default=[], max_length=50)
@@ -48,9 +71,26 @@ class ManualListingIn(BaseModel):
                     raise ValueError("each tag must be at most 200 characters")
         return v
  
+    @field_validator("type")
+    @classmethod
+    def _known_type(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if v not in MANUAL_TYPES:
+            raise ValueError("type must be one of: " + ", ".join(sorted(MANUAL_TYPES)))
+        return v
+ 
+    @field_validator("apply_url")
+    @classmethod
+    def _http_url(cls, v: str) -> str:
+        if v.strip() and not v.strip().lower().startswith(("https://", "http://")):
+            raise ValueError("apply_url must be an http(s) link")
+        return v
+ 
  
 @router.post("")
-def add_manual_listing(payload: ManualListingIn, db: Session = Depends(get_db), _auth: dict = Depends(require_valid_token)):
+def add_manual_listing(payload: ManualListingIn, db: Session = Depends(get_db), _auth: dict = Depends(require_admin)):
+    from app.services.rate_limit import rate_limit
+    rate_limit(db, str(_auth.get("sub")), "manual-listing-add", limit_per_day=MANUAL_DAILY_LIMIT)
     if not payload.title.strip() or not payload.org.strip() or not payload.apply_url.strip():
         raise HTTPException(status_code=400, detail="title, org, and apply_url cannot be empty")
     # apply_url anchors this instead of title+org - a real, different
