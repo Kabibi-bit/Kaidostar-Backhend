@@ -18,22 +18,26 @@ router = APIRouter(prefix="/saved", tags=["saved"])
 class SaveIn(BaseModel):
     user_id: str
     listing_id: str
+    # Job Search v2 saves a job WITHOUT drafting (drafting is its own button).
+    # Older clients omit it and keep the original star-drafts behaviour.
+    draft: bool = True
  
  
 @router.post("")
 def save_listing(payload: SaveIn, db: Session = Depends(get_db), authorization: str = Header(None)):
+    """Stars a listing - this is what backs the frontend's star icon
+    and Saved panel. Unless the caller passes draft=false (Job Search v2
+    does: drafting there is its own, explicit button), starring ALSO drafts
+    a tailored application for that match (via create_application_for_match),
+    landing in the Workshop page for review/approval/send. If the draft fails
+    for any reason (no profile yet, a deal-breaker conflict, an AI call
+    failure), the star itself still succeeds - drafting failures never block
+    the save.
+    """
     client = get_client()
-    if client is None:
+    if client is None and payload.draft:
         from fastapi import HTTPException as _HE
         raise _HE(status_code=503, detail="AI service is not configured. Please try again later.")
-    """Stars a listing - this is what backs the frontend's star icon
-    and Saved panel. Starring ALSO automatically drafts a tailored
-    application for that match (via create_application_for_match),
-    landing in the Workshop page for review/approval/send. If the
-    draft fails for any reason (no profile yet, a deal-breaker
-    conflict, an AI call failure), the star itself still succeeds -
-    drafting failures never block the save.
-    """
     import uuid as uuid_module
     try:
         uuid_module.UUID(payload.user_id)
@@ -64,10 +68,19 @@ def save_listing(payload: SaveIn, db: Session = Depends(get_db), authorization: 
         db.rollback()
         return {"status": "already saved"}
  
+    if not payload.draft:
+        return {"status": "saved", "application_drafted": False, "application_id": None}
+ 
     draft_result = None
     try:
         rate_limit_by_tier(db, payload.user_id, "application-draft", per_action_limit=300)
-        draft_result = create_application_for_match(db, client, payload.user_id, payload.listing_id)
+        fit = None
+        try:
+            from app.routes.applications import _v2_fit_or_none
+            fit = _v2_fit_or_none(db, payload.user_id, payload.listing_id)
+        except Exception:
+            fit = None
+        draft_result = create_application_for_match(db, client, payload.user_id, payload.listing_id, fit_override=fit)
         if draft_result.get("error"):
             draft_result = None  # profile missing, dealbreaker conflict, etc. - just skip silently
     except Exception:
