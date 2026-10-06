@@ -105,6 +105,19 @@ class Listing(Base):
     salary_max = Column(Integer, nullable=True)
     salary_is_predicted = Column(Boolean, nullable=True)  # None means genuinely no salary data at all - absent is honestly different from a real, disclosed 0
     embedding = Column(Vector(512), nullable=True)  # None until embedded - see app/services/embeddings.py
+    # Job Search v2 (Proof Match). Freshness is judged by when the EMPLOYER
+    # posted the job, not when we fetched it; last_seen_at/seen_count show
+    # whether it's still live at the source; canonical_key (company|title|place)
+    # lets a quietly reposted job be recognised as the same job.
+    # Requires db/schema_additions_job_search_v2.sql (also in RUN_THIS_migration.sql).
+    posted_at = Column(DateTime, nullable=True)
+    last_seen_at = Column(DateTime, nullable=True)
+    seen_count = Column(Integer, nullable=True)
+    repost_count = Column(Integer, nullable=True)
+    employment_type = Column(String, nullable=True)   # full_time / part_time (from the source, when it says)
+    contract_type = Column(String, nullable=True)     # permanent / contract
+    category = Column(String, nullable=True)          # the source's own category label
+    canonical_key = Column(String, nullable=True, index=True)
  
  
 class MatchScore(Base):
