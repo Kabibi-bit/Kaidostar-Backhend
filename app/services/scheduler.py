@@ -42,6 +42,12 @@ from app.services.matching import rank_listings
 from app.services.timeutil import utcnow
 from app.services.embeddings import generate_embedding
  
+# An approved application that came due more than this many days ago is never auto-sent (see the auto-send pass).
+try:   # (a bad value must never stop the app from starting - this module is imported at startup)
+    AUTO_SEND_MAX_AGE_DAYS = max(1, int(os.getenv("AUTO_SEND_MAX_AGE_DAYS", "7")))
+except ValueError:
+    AUTO_SEND_MAX_AGE_DAYS = 7
+ 
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "1440"))  # default: once/day
 # The Anthropic client is resolved LAZILY at scan time via get_client(), never
 # constructed here at module scope. main.py does `from app.services.scheduler
@@ -271,7 +277,9 @@ def backfill_missing_embeddings(db: Session, batch_size: int = 100) -> dict:
     if not is_configured():
         return {"attempted": 0, "succeeded": 0, "detail": "VOYAGE_API_KEY is not set - nothing to backfill until it's configured."}
  
-    candidates = db.query(Listing).filter(Listing.embedding.is_(None)).limit(batch_size).all()
+    from app.services.feed_common import not_feed
+    # employer-feed jobs are never embedded: hundreds of thousands of paid embedding calls for no use
+    candidates = db.query(Listing).filter(Listing.embedding.is_(None)).filter(not_feed(Listing)).limit(batch_size).all()
     succeeded = 0
     for listing in candidates:
         embedding = _embed_listing(listing.title, listing.description, listing.tags)
@@ -510,7 +518,8 @@ def run_scan_for_user(db: Session, user_id: str) -> dict:
     if not profile:
         return {"status": "no active profile", "user_id": user_id}
  
-    listings = db.query(Listing).all()
+    from app.services.feed_common import not_feed
+    listings = db.query(Listing).filter(not_feed(Listing)).all()   # the v1 ranking reads tags/embeddings employer-feed jobs don't have
     from app.models.db_models import DismissedListing
     dismissed_ids = {str(row.listing_id) for row in db.query(DismissedListing).filter(DismissedListing.user_id == user_id).all()}
     ranked = rank_listings(
@@ -606,7 +615,8 @@ def run_scan_for_all_users():
         # redundant full-table loads. Fetched here and reused below.
         # Turned into plain dicts right away: ORM rows expire at every commit inside
         # the loop below, and re-reading them would mean one query per listing per user.
-        all_listing_dicts_this_cycle = [_listing_to_dict(l) for l in db.query(Listing).all()]
+        from app.services.feed_common import not_feed
+        all_listing_dicts_this_cycle = [_listing_to_dict(l) for l in db.query(Listing).filter(not_feed(Listing)).all()]
         # The Job Search v2 pool (jobs/internships/programs, newest first) - also
         # built once, as engine-ready dicts, and shared by every user's Auto pass
         # and saved-search alerts.
@@ -724,7 +734,10 @@ def run_scan_for_all_users():
                 # fail-safe internally; the outer try is belt-and-suspenders.
                 try:
                     from app.services.weekly_digest import maybe_send_weekly_digest
-                    from app.models.db_models import MatchScore, Listing, SavedListing, Application, AthleteEvent, Notification as _Notif
+                    # (MatchScore and Listing come from this module's own imports: importing them again
+                    # anywhere in this function would make them local names for ALL of it, and the
+                    # earlier `db.query(Listing)` would then fail with UnboundLocalError - the whole scan with it)
+                    from app.models.db_models import SavedListing, Application, AthleteEvent, Notification as _Notif
                     _digest_profile = (
                         db.query(Profile)
                         .filter(Profile.user_id == user.id, Profile.is_current == True)  # noqa: E712
@@ -765,7 +778,7 @@ def run_scan_for_all_users():
         # per application. Isolated in its own try/except so a real
         # failure here can never retroactively undo the scan above.
         try:
-            from app.models.db_models import Application, Listing
+            from app.models.db_models import Application   # (Listing: this module's own import - see above)
             # Deliver via the SAME real path as the manual /send route. Previously
             # this loop just flipped status to "sent" in bulk WITHOUT delivering
             # anything - no email, no submission - fabricating a "sent" for
@@ -784,6 +797,15 @@ def run_scan_for_all_users():
             )
             sent_counts_by_user = {}
             handoff_counts_by_user = {}
+            closed_counts_by_user = {}
+            stale_counts_by_user = {}
+            # An approval that came due long ago and was never sent (this scan was down for a while) is not
+            # sent blind now: the posting may be gone and the person may have moved on. It goes back to
+            # "needs review" - one click re-approves it - and they're told. Normal approvals come due within
+            # the day (the undo window, or none with autonomous consent), so this never touches them.
+            from datetime import timedelta as _td
+            from app.services.timeutil import to_naive_utc as _naive
+            _stale_before = now - _td(days=AUTO_SEND_MAX_AGE_DAYS)
             for app_record in due_to_send:
                 # Per-application isolation: one failed delivery must not abort the
                 # rest of the batch (matches this file's design elsewhere).
@@ -798,25 +820,38 @@ def run_scan_for_all_users():
                     db.refresh(app_record)
                     if app_record.status != "approved":
                         continue
+                    _due = _naive(app_record.sendable_at)
+                    if _due is not None and _due < _stale_before:
+                        app_record.status = "pending_review"
+                        app_record.sendable_at = None
+                        db.commit()
+                        stale_counts_by_user[app_record.user_id] = stale_counts_by_user.get(app_record.user_id, 0) + 1
+                        continue
                     listing = db.query(Listing).filter(Listing.id == app_record.listing_id).first()
                     if not listing:
                         continue
+                    # (a job from an employer's career site that Kaidostar can no longer vouch for as
+                    # open is never sent - deliver_accepted_application hands it back instead)
                     res = deliver_accepted_application(db, app_record, listing, anthropic_client, unattended=True)
                     uid = app_record.user_id
                     if res.get("status") == "sent":
                         sent_counts_by_user[uid] = sent_counts_by_user.get(uid, 0) + 1
+                    elif res.get("posting_closed"):
+                        closed_counts_by_user[uid] = closed_counts_by_user.get(uid, 0) + 1
                     elif res.get("status") == "ready_to_submit":
                         handoff_counts_by_user[uid] = handoff_counts_by_user.get(uid, 0) + 1
                 except Exception as _send_err:
                     db.rollback()
                     print(f"    Auto-send skipped for application {getattr(app_record, 'id', '?')}: {_send_err}")
             sent_count = sum(sent_counts_by_user.values())
-            if sent_counts_by_user or handoff_counts_by_user:
+            if sent_counts_by_user or handoff_counts_by_user or closed_counts_by_user or stale_counts_by_user:
                 # Notify each affected user with their own genuine counts: what was
                 # actually sent, and what is now waiting for them to submit (honest -
                 # a web hand-off is NOT a send). Respect the auto_apply mute.
-                from app.models.db_models import Profile
-                affected = set(sent_counts_by_user) | set(handoff_counts_by_user)
+                # (Profile is this module's own import: re-importing it here made it a local name for the
+                # whole function, so the scan's very first `join(Profile)` raised UnboundLocalError and
+                # every daily scan stopped there - no rescoring, Auto, alerts, digests or auto-send.)
+                affected = set(sent_counts_by_user) | set(handoff_counts_by_user) | set(closed_counts_by_user) | set(stale_counts_by_user)
                 profiles = db.query(Profile).filter(Profile.user_id.in_(list(affected)), Profile.is_current == True).all()  # noqa: E712
                 prefs_by_user = {p.user_id: (p.notification_preferences or {}) for p in profiles}
                 for uid in affected:
@@ -835,8 +870,26 @@ def run_scan_for_all_users():
                             title=f"{hc} application{'s' if hc != 1 else ''} ready for you to submit",
                             detail="These couldn't be sent automatically (the posting needs you to submit it). Open the Workshop to finish them.",
                         ))
+                    oc = stale_counts_by_user.get(uid, 0)
+                    if oc > 0:
+                        db.add(Notification(
+                            user_id=uid, type="auto_apply",
+                            title=f"{oc} approved application{'s' if oc != 1 else ''} need{'' if oc != 1 else 's'} your OK again before sending",
+                            detail=(f"{'They were' if oc != 1 else 'It was'} approved more than {AUTO_SEND_MAX_AGE_DAYS} days ago and never sent, so Kaidostar "
+                                    "didn't send " + ("them" if oc != 1 else "it") + " now. Check the posting is still open, then approve in the Workshop to send."),
+                        ))
+                    cc = closed_counts_by_user.get(uid, 0)
+                    if cc > 0:
+                        db.add(Notification(
+                            user_id=uid, type="auto_apply",
+                            title=f"{cc} approved application{'s' if cc != 1 else ''} not sent: the job may have closed",
+                            detail=("Kaidostar can no longer confirm " + ("these jobs are" if cc != 1 else "this job is") + " still open on the employer's site, "
+                                    "so nothing was sent. If a posting is still up, you can submit your application there from the Workshop."),
+                        ))
                 db.commit()
-                print(f"Auto-send: {sent_count} application(s) genuinely sent; {sum(handoff_counts_by_user.values())} handed off for manual submission.")
+                print(f"Auto-send: {sent_count} application(s) genuinely sent; {sum(handoff_counts_by_user.values())} handed off for manual submission; "
+                      f"{sum(closed_counts_by_user.values())} not sent because the job may have closed; "
+                      f"{sum(stale_counts_by_user.values())} approved long ago sent back for review.")
         except Exception as e:
             # Roll back so the session is clean for the finally that closes it.
             db.rollback()
@@ -847,6 +900,15 @@ def run_scan_for_all_users():
         db.close()
  
  
+def _feed_tick_job():
+    """A few minutes of employer-feed crawling (see feed_crawler.py). Never raises."""
+    try:
+        from app.services.feed_crawler import run_feed_tick
+        run_feed_tick()
+    except Exception as e:
+        print(f"Employer-feed tick failed (non-fatal): {e}")
+ 
+ 
 def start_scheduler():
     scheduler = BackgroundScheduler()
     scheduler.add_job(
@@ -854,6 +916,10 @@ def start_scheduler():
         max_instances=1,  # never run two scans at once (explicit; also APScheduler default)
         coalesce=True,    # if runs pile up (e.g. after downtime), collapse to a single catch-up run
     )
+    # Employer career-site feeds: a short crawl slice every few minutes while the service is up.
+    # (On a plan that sleeps when idle, /feeds/tick called by a free pinger keeps both going.)
+    feed_minutes = max(5, int(os.getenv("FEED_TICK_MINUTES", "10")))
+    scheduler.add_job(_feed_tick_job, "interval", minutes=feed_minutes, max_instances=1, coalesce=True)
     scheduler.start()
     return scheduler
  
