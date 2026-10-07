@@ -79,7 +79,8 @@ def build_system_context(db: Session, user_id: str) -> str:
             f"Priorities: {', '.join(profile.priorities or [])}. "
             f"Skills: \"{profile.skills}\"."
         )
-        listings = db.query(Listing).all()
+        from app.services.feed_common import not_feed
+        listings = db.query(Listing).filter(not_feed(Listing)).all()
         if listings:
             from app.models.db_models import DismissedListing
             dismissed_ids = {str(row.listing_id) for row in db.query(DismissedListing).filter(DismissedListing.user_id == user_id).all()}
