@@ -371,6 +371,13 @@ def create_application_for_match(db, anthropic_client, user_id: str, listing_id:
         .filter(Application.user_id == user_id, Application.listing_id == listing_id)
         .first()
     )
+    # An employer-feed job Kaidostar can no longer vouch for as open gets no new draft (the paid
+    # drafting call would be wasted, and Auto must never queue one); an existing one is still returned.
+    from app.services.feed_common import listing_closed
+    if existing is None or existing.status == "undone":
+        closed = listing_closed(db, listing)
+        if closed is not None:
+            return {"error": "posting_closed", "closed": closed}
     # An application the user discarded ("undone", never sent) is re-opened when THEY ask for
     # it again (a fresh draft, re-decided) - there can be only one row per job, so answering
     # "you already have one" would leave a dead end. Auto never re-opens it.
@@ -394,14 +401,17 @@ def create_application_for_match(db, anthropic_client, user_id: str, listing_id:
         "location_pref": profile.location_pref or "",
         "embedding": generate_embedding(goal_text, input_type="query"),
     }
+    from app.services.feed_common import listing_text, listing_tags
+    posting_text = listing_text(db, listing)
     listing_dict = {
         "type": listing.type,
-        "tags": listing.tags or [],
+        # employer-feed jobs carry no stored tags: the skills read in their posting stand in
+        "tags": listing_tags(db, listing, text=posting_text),
         "title": listing.title,
         "org": listing.org,
         "location": listing.location,
         "deadline": listing.deadline.isoformat() if listing.deadline else None,
-        "description": listing.description or "",
+        "description": posting_text,
         "embedding": list(listing.embedding) if listing.embedding is not None else None,
     }
  
@@ -582,9 +592,10 @@ def draft_outreach_for_match(db, anthropic_client, user_id: str, listing_id: str
     if not guess.get("candidates"):
         return {"error": "no_contact_guess"}
  
+    from app.services.feed_common import listing_tags
     prompt = (
         f"A candidate is applying to \"{listing.title}\" at {listing.org} ({listing.type}), "
-        f"tags: {', '.join(listing.tags or [])}. Their background: skills \"{profile.skills or ''}\", "
+        f"tags: {', '.join(listing_tags(db, listing))}. Their background: skills \"{profile.skills or ''}\", "
         f"goal \"{profile.northstar}\".\n\n"
         "Write a genuine, specific 80-120 word referral outreach email body, plus a short subject "
         "line. Reference the candidate's real skills/goal and the specific role, ask for a short "
@@ -731,9 +742,10 @@ def draft_leadership_grounded_outreach(db, anthropic_client, user_id: str, listi
             "actually found."
         )
  
+    from app.services.feed_common import listing_tags
     prompt = (
         f"A candidate is applying to \"{listing.title}\" at {listing.org} ({listing.type}), "
-        f"tags: {', '.join(listing.tags or [])}. Their background: skills \"{profile.skills or ''}\", "
+        f"tags: {', '.join(listing_tags(db, listing))}. Their background: skills \"{profile.skills or ''}\", "
         f"goal \"{profile.northstar}\".\n\n"
         f"{research_block}\n\n"
         "Write a genuine, specific 80-120 word referral outreach email body, plus a short subject line. "
