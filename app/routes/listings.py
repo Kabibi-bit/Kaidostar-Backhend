@@ -1,4 +1,5 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi.responses import Response
 import logging
 import threading
 from app.services.auth import require_auth_for_user
@@ -80,35 +81,96 @@ def _listing_to_dict(l: Listing) -> dict:
         "fetched_at": l.fetched_at.isoformat() if l.fetched_at else None,
     }
  
+def _csv_param(v, cap=20, item_chars=60):
+    if not isinstance(v, str) or not v.strip():
+        return []
+    return [x.strip()[:item_chars] for x in v.split(",") if x.strip()][:cap]
+ 
+ 
+POOL_DAILY_LIMIT = 400              # the page asks on load, every 15 minutes and when a search changes field or place
+_POOL_IN_FLIGHT = set()
+_POOL_LOCK = threading.Lock()
+ 
+ 
 @router.get("/pool/{user_id}")
-def get_pool(user_id: str, db: Session = Depends(get_db), _auth: dict = Depends(require_auth_for_user)):
+def get_pool(user_id: str, request: Request, db: Session = Depends(get_db), _auth: dict = Depends(require_auth_for_user),
+             roles: str | None = None, loc: str | None = None, modes: str | None = None, kw: str | None = None):
     """Job Search v2: everything the browser's Proof Match engine needs to
     score this user's search on the device - the listing pool (jobs,
     internships and programs, newest by the employer's own posting date,
     never past their deadline), the user's dismissed and saved ids, their
     resume entries, and their saved search state (preferences, learned
     rules, saved searches). The server runs the identical engine for Auto
-    and alerts, so both sides agree on every score."""
+    and alerts, so both sides agree on every score.
+ 
+    On top of the shared pool come the employer career-site jobs picked for
+    this person from the much larger employer pool: the role families their
+    goal (or the search on the page - roles / loc / modes / kw) names, where
+    they'd work. Every one is still scored in full on the page."""
     import uuid as uuid_module
-    from datetime import datetime as _dt, timezone as _tz
-    from app.models.db_models import DismissedListing, SavedListing, ResumeEntry
-    from app.services import job_search as JSV
-    from app.services.job_engine import ENGINE_VERSION
     try:
         uuid_module.UUID(user_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="No current profile for this user")
+    # one pool at a time per person (a fast typist's searches don't stack up on a small server)
+    with _POOL_LOCK:
+        if user_id in _POOL_IN_FLIGHT:
+            raise HTTPException(status_code=429, detail="Your listings are already loading - try again in a moment.")
+        _POOL_IN_FLIGHT.add(user_id)
+    try:
+        from app.services.rate_limit import rate_limit
+        rate_limit(db, user_id, "listing-pool", limit_per_day=POOL_DAILY_LIMIT)
+        payload = _pool_payload(user_id, db, roles, loc, modes, kw)
+    finally:
+        with _POOL_LOCK:
+            _POOL_IN_FLIGHT.discard(user_id)
+    # a few MB of posting text: serialised and compressed here, in the worker thread - never on the event loop
+    import gzip
+    import json as _json
+    body = _json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")
+    if "gzip" in (request.headers.get("accept-encoding") or "").lower() and len(body) > 4096:
+        return Response(content=gzip.compress(body, compresslevel=5), media_type="application/json",
+                        headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"})
+    return Response(content=body, media_type="application/json", headers={"Vary": "Accept-Encoding"})
+ 
+ 
+def _pool_payload(user_id, db, roles, loc, modes, kw) -> dict:
+    from datetime import datetime as _dt, timezone as _tz
+    from app.models.db_models import DismissedListing, SavedListing, ResumeEntry
+    from app.services import job_search as JSV
+    from app.services.job_engine import ENGINE_VERSION
     listings = JSV.pool_dicts(db)
     dismissed = sorted({str(r.listing_id) for r in db.query(DismissedListing).filter(DismissedListing.user_id == user_id).all()})
     saved = sorted({str(r.listing_id) for r in db.query(SavedListing).filter(SavedListing.user_id == user_id).all()})
     applied = sorted(JSV.applied_listing_ids(db, user_id))
     entries = JSV.entries_for_engine(db.query(ResumeEntry).filter(ResumeEntry.user_id == user_id).all())
     state, state_ok = JSV.load_state_checked(db, user_id)
+    pool_count = len(listings)
+    feed, coverage = [], None
+    try:
+        profile = db.query(Profile).filter(Profile.user_id == user_id, Profile.is_current == True).first()  # noqa: E712
+        query = {"roles": _csv_param(roles), "loc": (loc or "")[:200], "modes": _csv_param(modes, 3), "keywords": _csv_param(kw, 6, 40)}
+        prefs = (state or {}).get("prefs") if isinstance((state or {}).get("prefs"), dict) else {}
+        feed = JSV.feed_dicts(db, JSV.feed_want(JSV.profile_for_engine(profile), entries, prefs, query))
+        # the employer jobs you saved or applied to stay in your pool while they're open, whatever you search for
+        have = {d["id"] for d in feed} | {d["id"] for d in listings}
+        mine = [i for i in list(saved) + list(applied) if i not in have]
+        if mine:
+            feed = feed + JSV.feed_dicts_by_ids(db, mine)
+        from app.services.feed_crawler import coverage_cached
+        coverage = coverage_cached(db)
+    except Exception as e:
+        db.rollback()
+        _log.warning("employer-feed jobs skipped for %s: %s", user_id, e)
+    listings = listings + feed
     return {
         "engine_version": ENGINE_VERSION,
         "generated_at": _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "count": len(listings),
-        "truncated": len(listings) >= JSV.POOL_LIMIT,
+        "truncated": pool_count >= JSV.POOL_LIMIT,
+        # how many of the listings are employer career-site jobs picked for you, and the size of the pool they came from
+        "employer_count": len(feed),
+        "coverage": coverage,
         "listings": listings,
         "dismissed_ids": dismissed,
         "saved_ids": saved,
@@ -172,16 +234,17 @@ def _get_matches(user_id: str, engine, db):
         try:
             from app.services import job_search as JSV
             # "top matches" are the best fits, whatever display sort the Job Search page uses
-            return JSV.v2_matches_payload(JSV.analyze_for_user(db, user_id, profile, best_first=True))
+            return JSV.v2_matches_payload(JSV.analyze_for_user(db, user_id, profile, best_first=True, feed_limit=JSV.FEED_SERVER_LIMIT))
         except Exception as e:
             db.rollback()   # a failed query leaves the session unusable for the fallback below
             _log.warning("v2 matches failed for %s, using the original ranking: %s", user_id, e)
  
+    from app.services.feed_common import not_feed
     try:
-        listings = db.query(Listing).order_by(Listing.fetched_at.desc()).limit(LEGACY_MATCH_LIMIT).all()
+        listings = db.query(Listing).filter(not_feed(Listing)).order_by(Listing.fetched_at.desc()).limit(LEGACY_MATCH_LIMIT).all()
     except Exception:
         db.rollback()
-        listings = db.query(Listing).limit(LEGACY_MATCH_LIMIT).all()
+        listings = db.query(Listing).filter(not_feed(Listing)).limit(LEGACY_MATCH_LIMIT).all()
     if not listings:
         return {"matches": [], "note": "No listings in the database yet - run a scan first."}
  
@@ -297,7 +360,8 @@ async def trigger_scan(user_id: str, db: Session = Depends(get_db), _auth: dict 
         client = get_client()
         if profile and profile.auto_apply_enabled and client is not None:
             if getattr(profile, "is_athlete", False):
-                listings = db.query(Listing).all()
+                from app.services.feed_common import not_feed
+                listings = db.query(Listing).filter(not_feed(Listing)).all()
                 from app.models.db_models import DismissedListing
                 dismissed_ids = {str(row.listing_id) for row in db.query(DismissedListing).filter(DismissedListing.user_id == user_id).all()}
                 ranked = rank_listings([_listing_to_dict(l) for l in listings], _profile_to_dict(profile), top_n=10, dismissed_ids=dismissed_ids)
@@ -381,9 +445,12 @@ def explain_match_deep(user_id: str, listing_id: str, db: Session = Depends(get_
     if milestones:
         roadmap_line = "Their roadmap:\n" + "\n".join(f"{m.target_stage}. {m.title}" for m in milestones) + "\n\n"
  
+    from app.services.feed_common import listing_text, listing_tags
+    posting_text = listing_text(db, listing)   # employer-feed jobs keep their text compressed elsewhere
+    tags = listing_tags(db, listing, text=posting_text)   # ...and carry no stored tags: their posting's skills stand in
     description_line = ""
-    if listing.description:
-        description_line = f"The actual posting text (not just its extracted tags): \"{listing.description[:1500]}\"\n\n"
+    if posting_text:
+        description_line = f"The actual posting text (not just its extracted tags): \"{posting_text[:1500]}\"\n\n"
  
     prompt = (
         f"A candidate's goal: \"{profile.northstar}\". What 'made it' looks like: \"{profile.final_idea or ''}\". "
@@ -391,11 +458,11 @@ def explain_match_deep(user_id: str, listing_id: str, db: Session = Depends(get_
         f"Location preference: \"{profile.location_pref or ''}\".\n\n"
         f"{roadmap_line}"
         f"A listing they're considering: \"{listing.title}\" at {listing.org} ({listing.type}), "
-        f"location {listing.location or 'unspecified'}, tags: {', '.join(listing.tags or [])}.\n\n"
+        f"location {listing.location or 'unspecified'}, tags: {', '.join(tags)}.\n\n"
         f"{description_line}"
         "Write a genuine, specific 3-4 sentence case for why this is or isn't a strong match for "
         "THIS candidate specifically - reference their actual goal, skills, priorities, and roadmap "
-        f"by name where relevant.{' If the actual posting text above reveals something the tags alone would have missed - a specific requirement, a seniority signal, team context - point that out specifically.' if listing.description else ''} "
+        f"by name where relevant.{' If the actual posting text above reveals something the tags alone would have missed - a specific requirement, a seniority signal, team context - point that out specifically.' if posting_text else ''} "
         "Be honest about weak fit if it's weak, don't oversell. No generic "
         "filler like 'this could be a great opportunity' - every sentence should reference a specific "
         "fact about the candidate or the listing."
@@ -455,9 +522,10 @@ def get_connection_strategy(user_id: str, listing_id: str, db: Session = Depends
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
  
+    from app.services.feed_common import listing_tags
     prompt = (
         f"A candidate is applying to \"{listing.title}\" at {listing.org} ({listing.type}), "
-        f"tags: {', '.join(listing.tags or [])}. Their background: skills \"{profile.skills or ''}\", "
+        f"tags: {', '.join(listing_tags(db, listing))}. Their background: skills \"{profile.skills or ''}\", "
         f"goal \"{profile.northstar}\".\n\n"
         "Help them get a real human connection at this company before applying cold. Return a JSON "
         "object with exactly these three keys:\n"
