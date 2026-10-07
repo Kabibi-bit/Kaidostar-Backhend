@@ -56,16 +56,21 @@ def save_listing(payload: SaveIn, db: Session = Depends(get_db), authorization: 
     )
     if existing:
         return {"status": "already saved"}
+    from app.models.db_models import Listing as _Listing
+    gone_detail = "This job was taken down by its employer, so it can't be saved."
+    if not db.query(_Listing.id).filter(_Listing.id == payload.listing_id).first():
+        raise HTTPException(status_code=404, detail=gone_detail)
  
     saved = SavedListing(user_id=payload.user_id, listing_id=payload.listing_id)
     db.add(saved)
     try:
         db.commit()
     except IntegrityError:
-        # Lost a race with a concurrent save of the same (user, listing): the winner
-        # already saved (and will draft). Mirror the "already saved" early return
-        # rather than 500 or double-drafting.
+        # Lost a race: either a concurrent save of the same (user, listing) - the winner
+        # already saved (and will draft) - or the job was removed at that very moment.
         db.rollback()
+        if not db.query(_Listing.id).filter(_Listing.id == payload.listing_id).first():
+            raise HTTPException(status_code=404, detail=gone_detail)
         return {"status": "already saved"}
  
     if not payload.draft:
