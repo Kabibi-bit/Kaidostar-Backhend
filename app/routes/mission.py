@@ -49,8 +49,13 @@ def get_mission(user_id: str, db: Session = Depends(get_db), _auth: dict = Depen
  
     # Applications, joined to their listing for org/title.
     apps = db.query(Application).filter(Application.user_id == user_id).all()
-    listings = db.query(Listing).all()
-    listing_by_id = {str(l.id): l for l in listings}
+    # the listings this user applied to (any source - employer-feed jobs included) for org/title, and the
+    # board listings for the ranking below (the v1 ranker reads tags employer-feed jobs don't carry)
+    from app.services.feed_common import not_feed
+    app_listing_ids = list({a.listing_id for a in apps if a.listing_id is not None})
+    app_listings = db.query(Listing).filter(Listing.id.in_(app_listing_ids)).all() if app_listing_ids else []
+    listings = db.query(Listing).filter(not_feed(Listing)).all()
+    listing_by_id = {str(l.id): l for l in app_listings}
     app_dicts = []
     for a in apps:
         l = listing_by_id.get(str(a.listing_id))
