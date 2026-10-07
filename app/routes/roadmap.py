@@ -37,7 +37,8 @@ def _compute_skill_gaps(db: Session, profile_dict: dict) -> list[str]:
     but aren't in their stated skills or goal - grounding the roadmap
     in real data instead of generic advice.
     """
-    listings = db.query(Listing).all()
+    from app.services.feed_common import not_feed
+    listings = db.query(Listing).filter(not_feed(Listing)).all()
     if not listings:
         return []
     listing_dicts = [
@@ -65,7 +66,8 @@ def _compute_skill_gaps(db: Session, profile_dict: dict) -> list[str]:
 def _ranked_listings(db: Session, profile_dict: dict, top_n: int = 10) -> list:
     """Real listings, scored and ranked for this user - the ground truth the
     pathways atlas is built from (supporting matches, top match, gap tags)."""
-    listings = db.query(Listing).all()
+    from app.services.feed_common import not_feed
+    listings = db.query(Listing).filter(not_feed(Listing)).all()
     if not listings:
         return []
     listing_dicts = [
@@ -329,7 +331,8 @@ def explain_listing(user_id: str, listing_id: str, db: Session = Depends(get_db)
         {"stage": m.target_stage, "title": m.title, "description": m.description, "success_criteria": m.success_criteria}
         for m in milestones
     ]
-    listing_dict = {"title": listing.title, "org": listing.org, "type": listing.type, "tags": listing.tags or []}
+    from app.services.feed_common import listing_tags
+    listing_dict = {"title": listing.title, "org": listing.org, "type": listing.type, "tags": listing_tags(db, listing)}
  
     try:
         explanation = explain_listing_against_roadmap(client, listing_dict, roadmap_dicts, _profile_to_dict(profile))
