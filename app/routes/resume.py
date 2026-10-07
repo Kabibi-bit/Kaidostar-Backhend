@@ -505,7 +505,8 @@ def tailor_resume_for_listing(user_id: str, listing_id: str, db: Session = Depen
          "end_date": e.end_date, "raw_description": e.raw_description}
         for e in entries
     ]
-    ranked = rank_entries_for_listing(entry_dicts, {"tags": listing.tags or []})
+    from app.services.feed_common import listing_tags
+    ranked = rank_entries_for_listing(entry_dicts, {"tags": listing_tags(db, listing)})
     return {"entries": ranked}
  
  
@@ -702,7 +703,8 @@ def download_tailored_resume_docx(user_id: str, listing_id: str, db: Session = D
  
     raw_entries = db.query(ResumeEntry).filter(ResumeEntry.user_id == user_id).all()
     raw_entry_dicts = [{"id": str(e.id), "title": e.title, "raw_description": e.raw_description} for e in raw_entries]
-    listing_dict = {"tags": listing.tags or []}
+    from app.services.feed_common import listing_tags
+    listing_dict = {"tags": listing_tags(db, listing)}
     ranked = rank_entries_for_listing(raw_entry_dicts, listing_dict)
     rank_order = {r["id"]: i for i, r in enumerate(ranked)}
  
@@ -771,7 +773,9 @@ def generate_cover_letter_for_listing(user_id: str, listing_id: str, db: Session
     profile = db.query(Profile).filter(Profile.user_id == user_id, Profile.is_current == True).first()  # noqa: E712
     profile_dict = {"northstar": profile.northstar if profile else "", "skills": profile.skills if profile else ""}
     entry_dicts = [{"title": e.title, "org": e.org, "raw_description": e.raw_description} for e in entries]
-    listing_dict = {"title": listing.title, "org": listing.org, "tags": listing.tags or [], "description": listing.description or ""}
+    from app.services.feed_common import listing_text
+    from app.services.feed_common import listing_tags
+    listing_dict = {"title": listing.title, "org": listing.org, "tags": listing_tags(db, listing), "description": listing_text(db, listing)}
  
     result = generate_cover_letter(client, profile_dict, entry_dicts, listing_dict)
     return result
