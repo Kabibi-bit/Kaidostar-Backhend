@@ -157,6 +157,22 @@ def deliver_accepted_application(db, app_record, listing, client=None, unattende
             "reasoning": "This listing was added by hand rather than found by a job source, so Kaidostar doesn't send it for you - submit it at the posting.",
         }
  
+    # A job read from an employer's own career site that Kaidostar can no longer vouch for (the
+    # employer's feed stopped listing it, its closing date passed, or the feed couldn't be read for
+    # days) is never emailed or auto-submitted - by Auto or by a click. Nothing paid runs for it; the
+    # finished application is handed back so the person can check the posting and decide.
+    from app.services.feed_common import listing_closed, closed_note
+    closed = listing_closed(db, listing)
+    if closed is not None:
+        app_record.status = "ready_to_submit"
+        app_record.sent_channel = "web"
+        db.commit()
+        return {
+            "status": "ready_to_submit", "channel": "web", "posting_closed": True,
+            "apply_url": listing.apply_url, "draft_content": app_record.draft_content,
+            "reasoning": closed_note(closed),
+        }
+ 
     # This function owns the paid work (the Metis channel call, the auto-submit) AND
     # its metering, so callers just hand it the application - they don't fetch a
     # client or meter themselves. Fetch the AI client here when one wasn't supplied.
@@ -166,9 +182,10 @@ def deliver_accepted_application(db, app_record, listing, client=None, unattende
     # Meter the paid Metis channel decision (fails open); mirrors the manual route.
     rate_limit_by_tier(db, str(app_record.user_id), "application-send", per_action_limit=200)
  
+    from app.services.feed_common import listing_text
     listing_dict = {
         "title": listing.title, "org": listing.org, "type": listing.type,
-        "description": listing.description, "apply_url": listing.apply_url,
+        "description": listing_text(db, listing), "apply_url": listing.apply_url,
     }
     plan = {"channel": "web", "to_address": None, "subject": "", "reasoning": ""}
     if client is not None:
@@ -331,6 +348,9 @@ def accept_match(payload: AcceptIn, db: Session = Depends(get_db), authorization
         raise HTTPException(status_code=404, detail="No current profile for this user")
     if result.get("error") == "listing_not_found":
         raise HTTPException(status_code=404, detail="Listing not found")
+    if result.get("error") == "posting_closed":
+        from app.services.feed_common import closed_draft_message
+        raise HTTPException(status_code=410, detail=closed_draft_message(result.get("closed")))
     if result.get("error") == "dealbreaker_conflict":
         raise HTTPException(status_code=400, detail="This listing conflicts with one of your stated deal-breakers - not drafting an application for it.")
  
@@ -382,9 +402,18 @@ def create_draft(payload: DraftIn, db: Session = Depends(get_db), authorization:
     listing = db.query(Listing).filter(Listing.id == payload.listing_id).first()
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
+    # a job from an employer's career site that may have closed gets no new (paid) draft - as /accept
+    from app.services.feed_common import listing_text, listing_tags, listing_closed, closed_draft_message
+    _closed = listing_closed(db, listing)
+    if _closed is not None:
+        raise HTTPException(status_code=410, detail=closed_draft_message(_closed))
  
     profile_dict = {"northstar": profile.northstar, "skills": profile.skills or ""}
-    listing_dict = {"title": listing.title, "org": listing.org, "tags": listing.tags or []}
+    posting_text = listing_text(db, listing)
+    # the posting text too, as the main accept path already gives it - and employer-feed jobs carry no
+    # stored tags, so the skills read in their posting stand in (they also pick which experience leads)
+    listing_dict = {"title": listing.title, "org": listing.org, "tags": listing_tags(db, listing, text=posting_text),
+                    "description": posting_text}
     resume_entry_rows = db.query(ResumeEntry).filter(ResumeEntry.user_id == payload.user_id).all()
     resume_entry_dicts = [{"title": e.title, "org": e.org, "raw_description": e.raw_description} for e in resume_entry_rows]
     draft_result = draft_application(client, listing_dict, profile_dict, resume_entry_dicts)
@@ -470,6 +499,16 @@ def list_applications(user_id: str, db: Session = Depends(get_db), _auth: dict =
         outcome_status_by_listing[str(o.listing_id)] = o.status
         outcome_time_by_listing[str(o.listing_id)] = o.updated_at
  
+    # A hand-off for a job from an employer's career site that Kaidostar can no longer vouch for as
+    # open says so on its Workshop card (the card shows send_reasoning) - one query for all of them.
+    from app.services.feed_common import closed_by_listing, closed_note
+    closed = closed_by_listing(db, [l for a, l in rows if a.status == "ready_to_submit"])
+ 
+    def _closed_extra(a, l):
+        c = closed.get(str(l.id)) if a.status == "ready_to_submit" else None
+        # a standing heads-up, not a cause: the hand-off may have happened earlier for another reason
+        return {"send_reasoning": closed_note(c, sent=False), "posting_closed": True} if c is not None else {}
+ 
     return [
         {
             "id": str(a.id),
@@ -504,6 +543,7 @@ def list_applications(user_id: str, db: Session = Depends(get_db), _auth: dict =
             # `is not None` (not truthiness) so a genuine 0 counterfactual survives.
             "counterfactual_confidence_pct": float(a.counterfactual_confidence_pct) if a.counterfactual_confidence_pct is not None else None,
             "factors_snapshot": a.factors_snapshot,
+            **_closed_extra(a, l),
         }
         for a, l in rows
     ]
@@ -789,7 +829,8 @@ def explain_outcome(application_id: str, db: Session = Depends(get_db), authoriz
     client = get_client()
     if client is None:
         raise HTTPException(status_code=503, detail="AI service is not configured. Please try again later.")
-    listing_dict = {"title": listing.title, "org": listing.org, "tags": listing.tags or []}
+    from app.services.feed_common import listing_tags
+    listing_dict = {"title": listing.title, "org": listing.org, "tags": listing_tags(db, listing)}
     profile_dict = {"northstar": profile.northstar, "skills": profile.skills or ""}
  
     try:
