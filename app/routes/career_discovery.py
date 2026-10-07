@@ -38,7 +38,8 @@ def submit_discovery(payload: DiscoveryAnswersIn, db: Session = Depends(get_db),
     verify_token_belongs_to_user(payload.user_id, authorization)
  
     answers = {"people": payload.people, "data": payload.data, "creative": payload.creative, "structure": payload.structure, "free_text": payload.free_text}
-    listings = db.query(Listing).all()
+    from app.services.feed_common import not_feed
+    listings = db.query(Listing).filter(not_feed(Listing)).all()
     all_tags = [l.tags or [] for l in listings]
     directions = score_career_directions(answers, all_tags)
  
