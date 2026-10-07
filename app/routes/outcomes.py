@@ -261,12 +261,17 @@ def get_personalization_insights(user_id: str, db: Session = Depends(get_db), _a
         # time so the numbering is stable and chronologically sensible.
         .all()
     )
+    # employer-feed jobs carry no stored tags - the skills read in their postings stand in, read in one
+    # query, and only for the applications the insight can actually use (a draft and an outcome)
+    from app.services.feed_common import tags_by_listing
+    tags = tags_by_listing(db, [listing for a, listing in applications
+                                if a.draft_content and outcome_by_listing.get(str(a.listing_id))])
     app_input = [
         {
             "draft_content": a.draft_content,
             "listing_title": listing.title,
             "listing_org": listing.org,
-            "listing_tags": listing.tags or [],
+            "listing_tags": tags.get(str(listing.id), listing.tags or []),
             "outcome_status": outcome_by_listing.get(str(a.listing_id)),
         }
         for a, listing in applications
@@ -368,7 +373,9 @@ def get_reminders(user_id: str, db: Session = Depends(get_db), _auth: dict = Dep
         latest_outcome[str(o.listing_id)] = (o.status, o.updated_at)
  
     applications = db.query(Application).filter(Application.user_id == user_id).all()
-    listings = {str(l.id): l for l in db.query(Listing).all()}
+    # only the listings this user applied to - the table also holds the large employer-job pool
+    app_listing_ids = list({a.listing_id for a in applications if a.listing_id is not None})
+    listings = {str(l.id): l for l in db.query(Listing).filter(Listing.id.in_(app_listing_ids)).all()} if app_listing_ids else {}
  
     interview_followups = []
     stale_applications = []
