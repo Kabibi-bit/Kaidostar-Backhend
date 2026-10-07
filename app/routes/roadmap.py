@@ -10,7 +10,7 @@ import anthropic
 from app.services.ai_client import get_client
  
 from app.db import get_db
-from app.models.db_models import Profile, Listing, RoadmapMilestone, RoadmapSummary, SocialPost
+from app.models.db_models import Profile, Listing, RoadmapMilestone, RoadmapSummary, SocialPost, WorkshopItem
 from app.services.roadmap import generate_roadmap, explain_listing_against_roadmap
 from app.services.pathways import generate_pathways
 from app.services.matching import rank_listings, _terms_match, tokenize
@@ -231,6 +231,293 @@ def get_roadmap(user_id: str, db: Session = Depends(get_db), _auth: dict = Depen
             for m in milestones
         ]
     }
+ 
+ 
+# ---------------------------------------------------------------------------
+# The Proof Plan: the Roadmap page's saved route, steps, statuses and daily
+# readiness snapshots - plus the milestones and summary every other part of
+# Kaidostar reads (overview, Mission Control, Waypoint, chat, Auto's roadmap fit),
+# written together so they always agree. The page computes the plan from live
+# jobs (roadmap-engine.js); the server stores it, bounded and checked field by
+# field, and never invents any of it.
+# ---------------------------------------------------------------------------
+import json as _json
+import math as _math
+import re as _re
+ 
+PLAN_KIND = "roadmap_plan"
+PLAN_MAX_CHARS = 60000
+PLAN_MAX_ITEMS = 30
+PLAN_MAX_HISTORY = 60
+PLAN_MAX_MILESTONES = 16
+PLAN_MAX_ARCHIVE = 4
+PLAN_SAVES_PER_DAY = 1000
+_ROLE_ID = _re.compile(r"^[a-z0-9_]{1,60}$")
+_ROUTE_ID = _re.compile(r"^[a-z0-9_:]{1,80}$")
+_STEP_ID = _re.compile(r"^[a-z0-9_:.\-]{1,80}$")
+_ITEM_KINDS = {"skill", "prove", "credential", "network", "apply", "interview"}
+_USER_STATUSES = {"doing", "done", "skip"}
+_HAVE_LEVELS = {"missing", "adjacent", "related", "stated", "proven"}
+_MS_STATUSES = {"planned", "in_progress", "done"}
+_MS_FIELDS = {"title": 240, "description": 1500, "success_criteria": 700, "estimated_timeframe": 140, "first_action": 700,
+              "resource": 500, "risk": 500, "if_it_works": 500, "if_it_stalls": 500}
+_TIME_MIN, _TIME_MAX = 946684800000, 4102444800000   # 2000-01-01 .. 2100-01-01, in ms
+ 
+ 
+def _num(v):
+    return not isinstance(v, bool) and isinstance(v, (int, float)) and _math.isfinite(v)
+ 
+ 
+def _rnd(v):
+    # the page rounds halves up (Math.floor(x + 0.5)); Python's round() would round them to even
+    return int(_math.floor(v + 0.5))
+ 
+ 
+def _ms_time(v):
+    return int(_math.floor(v)) if _num(v) and _TIME_MIN <= v <= _TIME_MAX else None
+ 
+ 
+def _int_in(v, lo, hi):
+    if not _num(v):
+        return None
+    r = _rnd(v)
+    return r if lo <= r <= hi else None
+ 
+ 
+def _int_clamp(v, lo, hi):
+    return max(lo, min(hi, _rnd(v))) if _num(v) else None
+ 
+ 
+def _str_match(v, pattern):
+    # fullmatch: a trailing newline must fail here exactly as it does in the page's regex
+    return v if isinstance(v, str) and pattern.fullmatch(v) else None
+ 
+ 
+def _clean_items(raw) -> list[dict]:
+    items, seen = [], set()
+    for x in (raw if isinstance(raw, list) else [])[:200]:
+        if not isinstance(x, dict) or len(items) >= PLAN_MAX_ITEMS:
+            continue
+        sid = _str_match(x.get("id"), _STEP_ID)
+        kind = x.get("kind") if isinstance(x.get("kind"), str) and x.get("kind") in _ITEM_KINDS else None
+        if not sid or not kind or sid in seen:
+            continue
+        seen.add(sid)
+        o = {"id": sid, "kind": kind}
+        skill = _str_match(x.get("skillId"), _ROLE_ID)
+        if skill:
+            o["skillId"] = skill
+        if isinstance(x.get("haveAtStart"), str) and x["haveAtStart"] in _HAVE_LEVELS:
+            o["haveAtStart"] = x["haveAtStart"]
+        if isinstance(x.get("status"), str) and x["status"] in _USER_STATUSES:
+            o["status"] = x["status"]
+        for k in ("startedAt", "doneAt", "dueAt", "verifiedAt"):
+            t = _ms_time(x.get(k))
+            if t is not None:
+                o[k] = t
+        if _num(x.get("hours")) and x["hours"] > 0:
+            o["hours"] = _int_clamp(x["hours"], 1, 2000)
+        items.append(o)
+    return items
+ 
+ 
+def _clean_archive(raw) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    rows = []
+    for k, e in raw.items():
+        if not isinstance(k, str) or not _ROLE_ID.fullmatch(k) or not isinstance(e, dict):
+            continue
+        rows.append((k, {
+            "route": _str_match(e.get("route"), _ROUTE_ID), "forRoute": _str_match(e.get("forRoute"), _ROUTE_ID),
+            "startAt": _ms_time(e.get("startAt")), "baselineReadyAt": _ms_time(e.get("baselineReadyAt")),
+            "savedAt": _ms_time(e.get("savedAt")), "items": _clean_items(e.get("items")),
+        }))
+    # newest first, ties by role id - the same order the page keeps
+    rows.sort(key=lambda r: (-(r[1]["savedAt"] or 0), r[0]))
+    return {k: v for k, v in rows[:PLAN_MAX_ARCHIVE]}
+ 
+ 
+def clean_plan(raw) -> dict:
+    """The saved plan, exactly the fields the page's normPlan keeps - anything else is dropped,
+    every value bounded with the same rules. Mirrors RoadmapEngine.normPlan."""
+    p = raw if isinstance(raw, dict) else {}
+    history = []
+    hist = p.get("history") if isinstance(p.get("history"), list) else []
+    for h in hist[-PLAN_MAX_HISTORY:]:
+        if not isinstance(h, dict):
+            continue
+        at = _ms_time(h.get("at"))
+        if at is None:
+            continue
+        history.append({
+            "at": at, "role": _str_match(h.get("role"), _ROLE_ID) or "",
+            "n": _int_in(h.get("n"), 0, 1000000) or 0, "strong": _int_in(h.get("strong"), 0, 1000000) or 0,
+            "reach": _int_in(h.get("reach"), 0, 1000000) or 0, "median": _int_in(h.get("median"), 0, 100),
+        })
+    return {
+        "v": 1,
+        "role": _str_match(p.get("role"), _ROLE_ID),
+        "forRole": _str_match(p.get("forRole"), _ROLE_ID),
+        "route": _str_match(p.get("route"), _ROUTE_ID),
+        "forRoute": _str_match(p.get("forRoute"), _ROUTE_ID),
+        "hoursPerWeek": _int_clamp(p.get("hoursPerWeek"), 2, 60),
+        "targetAt": _ms_time(p.get("targetAt")),
+        "startAt": _ms_time(p.get("startAt")),
+        "items": _clean_items(p.get("items")),
+        "baselineReadyAt": _ms_time(p.get("baselineReadyAt")),
+        "readySince": _ms_time(p.get("readySince")),
+        "history": history,
+        "archive": _clean_archive(p.get("archive")),
+        "builtAt": _ms_time(p.get("builtAt")),
+        "updatedAt": _ms_time(p.get("updatedAt")),
+        "changedAt": _ms_time(p.get("changedAt")),
+    }
+ 
+ 
+def clean_milestones(raw) -> list[dict]:
+    """The shared milestone shape (title, description, success criteria, timeframe, first action, resource, risk,
+    if it works / stalls, status) - strings only, bounded, numbered 1..n in the order given."""
+    out = []
+    for m in (raw if isinstance(raw, list) else [])[:200]:
+        if len(out) >= PLAN_MAX_MILESTONES:
+            break
+        if not isinstance(m, dict):
+            continue
+        row = {}
+        for k, cap in _MS_FIELDS.items():
+            v = m.get(k)
+            row[k] = v.strip()[:cap] if isinstance(v, str) else ""
+        if not row["title"]:
+            continue
+        row["status"] = m.get("status") if m.get("status") in _MS_STATUSES else "planned"
+        row["stage"] = len(out) + 1
+        out.append(row)
+    return out
+ 
+ 
+class PlanIn(BaseModel):
+    plan: dict = Field(default_factory=dict)
+    milestones: list = Field(default_factory=list, max_length=200)
+    summary: str = Field(default="", max_length=4000)
+    # the changedAt of the account's copy this page last saw (null: it hasn't seen one). A save based on an older copy
+    # - another device changed the plan since - is refused with 409, so the page merges instead of overwriting.
+    base_changed_at: int | None = Field(default=None, ge=0)
+ 
+ 
+def _merge_history(stored: list, incoming: list) -> list:
+    """The daily readiness snapshots from both copies: one per day and destination, the incoming one winning a tie."""
+    by = {}
+    for h in list(stored or []) + list(incoming or []):
+        by[(h["at"] // 86400000, h["role"])] = h
+    return sorted(by.values(), key=lambda h: h["at"])[-PLAN_MAX_HISTORY:]
+ 
+ 
+def _plan_row(db: Session, user_id: str, lock: bool = False):
+    """The person's one plan record (the most recently updated, if an old race ever left two). Always the database's
+    current copy; lock=True holds the row (SELECT ... FOR UPDATE) until the commit, so two saves at the same moment
+    are checked one after the other - the same pattern as the Job Search state."""
+    q = db.query(WorkshopItem).filter(WorkshopItem.user_id == user_id, WorkshopItem.kind == PLAN_KIND)
+    try:
+        q = q.order_by(WorkshopItem.updated_at.desc().nullslast(), WorkshopItem.created_at.desc().nullslast())
+    except Exception:
+        q = q.order_by(WorkshopItem.updated_at.desc())
+    try:
+        q = q.populate_existing()
+    except Exception:
+        pass
+    if lock:
+        try:
+            q = q.with_for_update()
+        except Exception:
+            pass
+    return q.first()
+ 
+ 
+@router.get("/{user_id}/plan")
+def get_plan(user_id: str, db: Session = Depends(get_db), _auth: dict = Depends(require_auth_for_user)):
+    """Your saved Proof Plan (null when there isn't one yet)."""
+    import uuid as uuid_module
+    try:
+        uuid_module.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="No plan for this user")
+    require_feature(db, user_id, "roadmap")  # Roadmap is Pro+
+    row = _plan_row(db, user_id)
+    if row is None or not isinstance(row.data, dict):
+        return {"plan": None, "updated_at": None}
+    return {"plan": clean_plan(row.data), "updated_at": (row.updated_at.isoformat() + "Z") if row.updated_at else None}
+ 
+ 
+@router.put("/{user_id}/plan")
+def save_plan(user_id: str, payload: PlanIn, db: Session = Depends(get_db), _auth: dict = Depends(require_auth_for_user)):
+    """Saves the plan, and replaces the milestones and summary the rest of Kaidostar reads with the ones from the
+    same plan - one commit, so they can't disagree."""
+    import uuid as uuid_module
+    try:
+        uuid_module.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="No current profile for this user")
+    require_feature(db, user_id, "roadmap")  # Roadmap is Pro+
+    rate_limit(db, user_id, "roadmap-plan-save", limit_per_day=PLAN_SAVES_PER_DAY)
+    plan = clean_plan(payload.plan)
+    if len(_json.dumps(plan)) > PLAN_MAX_CHARS:
+        raise HTTPException(status_code=400, detail="The plan is too large to save.")
+    milestones = clean_milestones(payload.milestones)
+    summary = (payload.summary or "").strip()[:2000]
+    base = payload.base_changed_at if isinstance(payload.base_changed_at, int) and not isinstance(payload.base_changed_at, bool) else None
+    return _write_plan(db, user_id, plan, milestones, summary, base, retry=True)
+ 
+ 
+def _write_plan(db: Session, user_id: str, plan: dict, milestones: list, summary: str, base, retry: bool):
+    from sqlalchemy.exc import IntegrityError
+    from datetime import datetime as _dt
+    row = _plan_row(db, user_id, lock=True)
+    if row is not None and isinstance(row.data, dict):
+        stored = clean_plan(row.data)
+        stored_changed = stored.get("changedAt") or 0
+        # another device changed the plan since this page last saw it: refuse, so the page merges instead of overwriting
+        if stored_changed and stored_changed != (base or 0) and stored_changed > (plan.get("changedAt") or 0):
+            db.rollback()
+            raise HTTPException(status_code=409, detail="Your plan changed on another device - reload to merge, then save again.")
+        plan = dict(plan, history=_merge_history(stored["history"], plan["history"]))
+    if row is not None:
+        # one record per person: drop any stray duplicates, then update in place
+        db.query(WorkshopItem).filter(WorkshopItem.user_id == user_id, WorkshopItem.kind == PLAN_KIND, WorkshopItem.id != row.id).delete(synchronize_session=False)
+        row.data = plan
+        row.updated_at = _dt.utcnow()
+        try:
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(row, "data")
+        except Exception:
+            pass
+    else:
+        db.add(WorkshopItem(user_id=user_id, kind=PLAN_KIND, client_id=PLAN_KIND, data=plan))
+    if milestones:
+        db.query(RoadmapMilestone).filter(RoadmapMilestone.user_id == user_id).delete(synchronize_session=False)
+        for m in milestones:
+            db.add(RoadmapMilestone(
+                user_id=user_id, title=m["title"], description=m["description"], success_criteria=m["success_criteria"],
+                estimated_timeframe=m["estimated_timeframe"], first_action=m["first_action"], resource=m["resource"],
+                risk=m["risk"], if_it_works=m["if_it_works"], if_it_stalls=m["if_it_stalls"],
+                target_stage=m["stage"], status=m["status"],
+            ))
+        if summary:
+            srow = db.query(RoadmapSummary).filter(RoadmapSummary.user_id == user_id).first()
+            if srow is not None:
+                srow.summary = summary
+                srow.updated_at = _dt.utcnow()
+            else:
+                db.add(RoadmapSummary(user_id=user_id, summary=summary))
+    try:
+        db.commit()
+    except IntegrityError:
+        # two first saves at once (a double tab): the other one created the rows - update them instead
+        db.rollback()
+        if not retry:
+            raise HTTPException(status_code=409, detail="Your plan was saved from another tab at the same moment - try again.")
+        return _write_plan(db, user_id, plan, milestones, summary, base, retry=False)
+    return {"status": "saved", "milestones": len(milestones)}
  
  
 class MilestoneStatusIn(BaseModel):
