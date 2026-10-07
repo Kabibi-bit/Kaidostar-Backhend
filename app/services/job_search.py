@@ -12,6 +12,7 @@ the user's own profile, resume entries and saved preferences.
 """
 import copy
 import json
+import os
 import threading
 import time
 from datetime import date, timedelta
@@ -77,6 +78,7 @@ def listing_for_engine(l) -> dict:
         "salary_min": getattr(l, "salary_min", None),
         "salary_max": getattr(l, "salary_max", None),
         "salary_is_predicted": getattr(l, "salary_is_predicted", None),
+        "salary_period": getattr(l, "salary_period", None),
         "employment_type": getattr(l, "employment_type", None),
         "contract_type": getattr(l, "contract_type", None),
         "apply_url": l.apply_url or "",
@@ -498,9 +500,11 @@ def pool_rows(db, limit: int = POOL_LIMIT):
         q = q.options(defer(Listing.embedding))
     except Exception:
         pass
+    from app.services.feed_common import not_feed
     return (
         q
         .filter(Listing.type.in_(POOL_TYPES))
+        .filter(not_feed(Listing))   # employer-feed jobs are picked per person (feed_dicts), never as "the newest 800"
         .filter(or_(Listing.deadline.is_(None), Listing.deadline >= yesterday))
         .order_by(func.coalesce(Listing.posted_at, Listing.fetched_at).desc())
         .limit(limit)
@@ -517,6 +521,172 @@ def pool_dicts(db, limit: int = POOL_LIMIT) -> list:
     cycle: plain dicts don't expire when a user's scan commits, so 800 listings
     never turn into 800 lazy re-loads per user."""
     return [listing_for_engine(l) for l in pool_rows(db, limit)]
+ 
+ 
+# ------------------------------------------------------------------ employer-feed jobs for one person
+FEED_POOL_LIMIT = int(os.getenv("FEED_POOL_LIMIT", "600"))        # what the page gets on top of the shared pool
+FEED_SERVER_LIMIT = int(os.getenv("FEED_SERVER_LIMIT", "400"))    # what Auto and alerts score on the server
+FEED_PER_EMPLOYER = 25                                            # no single employer fills someone's pool
+FEED_ADJ_MIN = 0.5                                                # neighbouring role families this close are worth a look
+FEED_STALE_DAYS = 4                                               # an employer not re-read for this long: its jobs aren't vouched for
+ 
+ 
+def _adjacent_roles(role_ids) -> list:
+    out = []
+    for a, b, w in JE.TAX.get("role_adj") or []:
+        if w is None or w < FEED_ADJ_MIN:
+            continue
+        if a in role_ids and b not in role_ids:
+            out.append(b)
+        elif b in role_ids and a not in role_ids:
+            out.append(a)
+    return list(dict.fromkeys(out))
+ 
+ 
+def feed_want(prof, entries, prefs, query=None) -> dict:
+    """Who to look for in the employer pool - read with the engine's own candidate reader, so it
+    names the same role families and places the scoring will: the roles you aim for (and the ones
+    a search on the page names), then neighbouring families and the ones your own work history
+    is in; where you'd work (or anywhere / remote); jobs or internships as your profile says."""
+    query = query if isinstance(query, dict) else {}
+    try:
+        cand = JE.build_candidate(prof or {}, entries or [], JE.merge_prefs(prefs or {}, None), _now_ms())
+    except Exception:
+        cand = {"roles": [], "location": {}}
+    goal = [r["id"] for r in cand.get("roles") or [] if isinstance(r, dict) and r.get("id")]
+    q_roles = [r for r in (query.get("roles") or []) if isinstance(r, str) and r in JE.idx().role]
+    primary = list(dict.fromkeys(q_roles or goal))
+    history = []
+    for e in entries or []:
+        if isinstance(e, dict) and (e.get("entry_type") or "work") in ("work", "internship", "volunteer"):
+            for r in JE.find_roles(e.get("title") or "")[:1]:
+                history.append(r["id"])
+    secondary = [r for r in dict.fromkeys(_adjacent_roles(primary) + history + ([] if not q_roles else goal)) if r not in primary]
+    loc = cand.get("location") or {}
+    if isinstance(query.get("loc"), str) and query["loc"].strip():
+        loc = JE.parse_user_location(query["loc"])
+    modes = [m for m in (query.get("modes") or []) if m in ("remote", "hybrid", "onsite")]
+    excl = set(m for m in ((prefs or {}).get("excludeModes") or []) if isinstance(m, str))   # "never" work modes
+    places = None                                   # None = anywhere
+    if modes == ["remote"] or loc.get("remoteOnly"):
+        places = ["w:remote"]
+    elif loc.get("metros") or loc.get("states"):
+        places = ["m:" + m for m in loc.get("metros") or []] + ["s:" + st for st in loc.get("states") or []]
+        if "remote" not in excl:
+            places.append("w:remote")
+    if loc.get("anywhere") and places != ["w:remote"]:
+        places = None
+    types = [t for t in (prof or {}).get("types") or [] if t in ("job", "internship")] or ["job", "internship"]
+    kw = [w.strip() for w in (query.get("keywords") or []) if isinstance(w, str) and 2 < len(w.strip()) <= 40][:6]
+    return {"primary": primary, "secondary": secondary, "places": places, "types": types, "keywords": kw}
+ 
+ 
+_EMPLOYER = "CASE WHEN l.source = 'usajobs' THEN 'u:' || l.org ELSE 'b:' || l.board_id END"   # one federal feed, many agencies
+ 
+ 
+def _feed_ids(db, want, limit, since=None) -> list:
+    from sqlalchemy import text
+    # only jobs still open, not past their closing date, from an employer we re-read recently
+    conds = ["l.board_id IS NOT NULL", "l.closed_at IS NULL", "l.feed_keys && CAST(:types AS text[])",
+             "(l.deadline IS NULL OR l.deadline >= :today)",
+             "EXISTS (SELECT 1 FROM employer_boards b WHERE b.id = l.board_id AND "
+             "(CASE WHEN b.ats = 'usajobs' THEN l.last_seen_at ELSE b.last_ok_at END) >= :fresh)"]
+    now = utcnow()
+    params = {"types": ["t:" + t for t in want["types"]], "n": int(limit), "per": FEED_PER_EMPLOYER,
+              "r1": ["r:" + r for r in want["primary"]], "r2": ["r:" + r for r in want["secondary"]],
+              "today": (now - timedelta(days=1)).date(), "fresh": now - timedelta(days=FEED_STALE_DAYS)}
+    if want["places"] is not None:
+        conds.append("l.feed_keys && CAST(:places AS text[])")
+        params["places"] = want["places"]
+    if since is not None:
+        conds.append("coalesce(l.posted_at, l.fetched_at) >= :since")
+        params["since"] = since
+    ids = []
+    if want["primary"] or want["secondary"]:
+        sql = ("WITH pick AS (SELECT l.id, " + _EMPLOYER + " AS emp, CASE WHEN l.feed_keys && CAST(:r1 AS text[]) THEN 1 ELSE 2 END AS tier, "
+               "coalesce(l.posted_at, l.fetched_at) AS at FROM listings l WHERE " + " AND ".join(conds) +
+               " AND l.feed_keys && CAST(:rall AS text[])), "
+               "ranked AS (SELECT id, tier, at, row_number() OVER (PARTITION BY emp ORDER BY tier, at DESC) AS k FROM pick) "
+               "SELECT id FROM ranked WHERE k <= :per ORDER BY tier, at DESC LIMIT :n")
+        params["rall"] = params["r1"] + params["r2"]
+        ids = [str(r[0]) for r in db.execute(text(sql), params).fetchall()]
+    if want["keywords"] and len(ids) < limit:
+        p2 = dict(params, pats=["%" + w.replace("%", "").replace("_", "") + "%" for w in want["keywords"]], n=int(limit) - len(ids))
+        sql = ("SELECT l.id FROM listings l WHERE " + " AND ".join(conds) + " AND l.title ILIKE ANY(CAST(:pats AS text[])) "
+               "ORDER BY coalesce(l.posted_at, l.fetched_at) DESC LIMIT :n")
+        seen = set(ids)
+        ids += [str(r[0]) for r in db.execute(text(sql), p2).fetchall() if str(r[0]) not in seen]
+    if not want["primary"] and not want["secondary"] and not want["keywords"]:
+        # nothing to aim at yet (an empty profile): the newest jobs where you are
+        sql = ("WITH ranked AS (SELECT l.id, coalesce(l.posted_at, l.fetched_at) AS at, row_number() OVER (PARTITION BY " + _EMPLOYER +
+               " ORDER BY coalesce(l.posted_at, l.fetched_at) DESC) AS k FROM listings l WHERE " + " AND ".join(conds) + ") "
+               "SELECT id FROM ranked WHERE k <= :per ORDER BY at DESC LIMIT :n")
+        ids = [str(r[0]) for r in db.execute(text(sql), params).fetchall()]
+    return ids[:int(limit)]
+ 
+ 
+_FEED_ROW_SQL = ("SELECT l.id, l.source, l.title, l.org, l.type, l.location, l.body_z, l.apply_url, l.fetched_at, l.posted_at, "
+                 "CASE WHEN b.ats = 'usajobs' THEN l.last_seen_at ELSE b.last_ok_at END AS seen_at, l.repost_count, l.salary_min, "
+                 "l.salary_max, l.salary_is_predicted, l.salary_period, l.employment_type, l.contract_type, l.deadline, l.closed_at "
+                 "FROM listings l JOIN employer_boards b ON b.id = l.board_id WHERE l.id = ANY(CAST(:ids AS uuid[]))")
+ 
+ 
+def feed_dicts(db, want, limit=FEED_POOL_LIMIT, since=None) -> list:
+    """This person's employer-feed jobs, already in the engine's shape. [] when the feeds aren't
+    set up (migration not run) or nothing matches - never an error for the caller."""
+    if limit <= 0:
+        return []
+    try:
+        with db.begin_nested():
+            ids = _feed_ids(db, want, limit, since)
+    except Exception as e:
+        print(f"  employer-feed jobs unavailable ({type(e).__name__}): {str(e)[:200]}")
+        return []
+    return feed_dicts_by_ids(db, ids)
+ 
+ 
+def feed_dicts_by_ids(db, ids, include_closed: bool = False) -> list:
+    """Employer-feed listings by id, in the engine's shape (the text decompressed, "last seen" =
+    when the employer's feed last confirmed it) - the same shape the page gets, so a job scores
+    the same wherever it is scored. Closed ones are left out unless include_closed."""
+    ids = [str(i) for i in ids or [] if i]
+    if not ids:
+        return []
+    from app.services.feed_common import decompress_text
+    try:
+        from sqlalchemy import text
+        with db.begin_nested():
+            rows = db.execute(text(_FEED_ROW_SQL), {"ids": ids}).mappings().all()
+    except Exception as e:
+        print(f"  employer-feed jobs unavailable ({type(e).__name__}): {str(e)[:200]}")
+        return []
+    order = {i: k for k, i in enumerate(ids)}
+    out = []
+    for r in sorted(rows, key=lambda r: order.get(str(r["id"]), 0)):
+        if r.get("closed_at") is not None and not include_closed:
+            continue
+        dl = r.get("deadline")
+        out.append({
+            "id": str(r["id"]), "type": r["type"] or "job", "title": r["title"] or "", "org": r["org"] or "", "location": r["location"] or "",
+            "description": decompress_text(r["body_z"])[:DESC_LIMIT], "posted_at": _iso(r["posted_at"]), "first_seen_at": _iso(r["fetched_at"]),
+            "last_seen_at": _iso(r["seen_at"]), "seen_count": None, "repost_count": r["repost_count"] or 0,
+            "salary_min": r["salary_min"], "salary_max": r["salary_max"], "salary_is_predicted": r["salary_is_predicted"],
+            "salary_period": r["salary_period"], "employment_type": r["employment_type"], "contract_type": r["contract_type"],
+            "apply_url": r["apply_url"] or "", "source": r["source"] or "", "deadline": dl.isoformat() if dl else None, "tags": [],
+        })
+    return out
+ 
+ 
+def feed_dicts_for_user(db, user_id, profile, state=None, query=None, limit=FEED_POOL_LIMIT, since=None) -> list:
+    from app.models.db_models import ResumeEntry
+    state = state if isinstance(state, dict) else load_state(db, user_id)
+    prefs = state.get("prefs") if isinstance(state.get("prefs"), dict) else {}
+    try:
+        entries = entries_for_engine(db.query(ResumeEntry).filter(ResumeEntry.user_id == user_id).all())
+    except Exception:
+        db.rollback()
+        entries = []
+    return feed_dicts(db, feed_want(profile_for_engine(profile), entries, prefs, query), limit=limit, since=since)
  
  
 def applied_listing_ids(db, user_id, include_undone: bool = False) -> set:
@@ -543,10 +713,12 @@ def applied_listing_ids(db, user_id, include_undone: bool = False) -> set:
         return set()
  
  
-def _inputs(db, user_id, profile, rows=None, state=None):
+def _inputs(db, user_id, profile, rows=None, state=None, feed_limit=0, feed_since=None):
     from app.models.db_models import DismissedListing, ResumeEntry
     state = state if isinstance(state, dict) else load_state(db, user_id)
     rows = rows if rows is not None else pool_rows(db)
+    if feed_limit:
+        rows = list(rows) + feed_dicts_for_user(db, user_id, profile, state=state, limit=feed_limit, since=feed_since)
     dismissed = {i: True for i in _id_set(db.query(DismissedListing).filter(DismissedListing.user_id == user_id).all())}
     applied_src = state.get("applied") if isinstance(state.get("applied"), list) else []
     applied = {str(x): True for x in applied_src if x is not None and not isinstance(x, (dict, list))}
@@ -557,17 +729,23 @@ def _inputs(db, user_id, profile, rows=None, state=None):
     learned = [r for r in learned_src if isinstance(r, dict)][-LEARNED_CAP:]
     prof = profile_for_engine(profile)
     entries = entries_for_engine(db.query(ResumeEntry).filter(ResumeEntry.user_id == user_id).all())
-    listings = [l if isinstance(l, dict) else listing_for_engine(l) for l in rows]
+    # an employer-feed job handed in as a database row is read in the page's shape (its text lives compressed
+    # in body_z, its "last seen" is its employer's last read) - so the server scores exactly what the card shows
+    from app.services.feed_common import is_feed_source
+    orm_feed = [str(l.id) for l in rows if not isinstance(l, dict) and is_feed_source(getattr(l, "source", None))]
+    fmap = {d["id"]: d for d in feed_dicts_by_ids(db, orm_feed, include_closed=True)} if orm_feed else {}
+    listings = [l if isinstance(l, dict) else (fmap.get(str(l.id)) or listing_for_engine(l)) for l in rows]
     opts = {"now": _now_ms(), "types": prof.get("types") or None, "dismissed": dismissed, "applied": applied, "useServerCache": True}
     return {"state": state, "listings": listings, "prof": prof, "entries": entries, "prefs": prefs, "learned": learned, "opts": opts}
  
  
-def analyze_for_user(db, user_id, profile, rows=None, state=None, extra_opts=None, best_first: bool = False):
+def analyze_for_user(db, user_id, profile, rows=None, state=None, extra_opts=None, best_first: bool = False, feed_limit: int = 0):
     """The same analyzePool the browser runs, for this user, on the live pool.
     best_first: rank by fit whatever display sort the user picked on the page -
     what Auto acts on and what other pages call "top matches" must be the best
-    fits, never the newest or best-paid."""
-    x = _inputs(db, user_id, profile, rows=rows, state=state)
+    fits, never the newest or best-paid. feed_limit: also score up to this many
+    of the employer-feed jobs picked for this person."""
+    x = _inputs(db, user_id, profile, rows=rows, state=state, feed_limit=feed_limit)
     opts = dict(x["opts"])
     opts.update(extra_opts or {})
     prefs = dict(x["prefs"], sort="best") if best_first else x["prefs"]
@@ -646,7 +824,7 @@ def auto_candidates(db, user_id, profile, rows=None, top_n: int = AUTO_TOP_N) ->
     pay floors set to Hide...) binds Auto too. score_pct is the v2 fit the
     user sees on the card, and v2_fit rides along so the approval decision
     uses the very same number."""
-    res = analyze_for_user(db, user_id, profile, rows=rows, best_first=True)
+    res = analyze_for_user(db, user_id, profile, rows=rows, best_first=True, feed_limit=FEED_SERVER_LIMIT)
     # a job you discarded an application for is yours to re-open, never Auto's to take again
     # (it would also spend a daily-cap slot on a job that can't be applied to twice)
     taken = applied_listing_ids(db, user_id, include_undone=True)
@@ -711,13 +889,17 @@ def run_saved_search_alerts(db, user_id, profile, rows=None, budget_s: float = A
     if not searches:
         return 0
     searches.sort(key=lambda s: _num(s.get("lastCheck")))
-    x = _inputs(db, user_id, profile, rows=rows, state=state)
+    # alerts are about new jobs: the employer-feed jobs posted in the alert window are enough
+    x = _inputs(db, user_id, profile, rows=rows, state=state, feed_limit=FEED_SERVER_LIMIT,
+                feed_since=utcnow() - timedelta(days=ALERT_MAX_AGE_DAYS + 1))
     pool_ids = set()
     for l in x["listings"]:
         pool_ids.add(str(l.get("id")))
     prefs_mute = (getattr(profile, "notification_preferences", None) or {}) if profile is not None else {}
     muted = prefs_mute.get("scan", True) is False
-    results, memo = {}, {}
+    results, memo, feed_memo = {}, {}, {}
+    alert_since = utcnow() - timedelta(days=ALERT_MAX_AGE_DAYS + 1)
+    have_ids = {str(l.get("id")) for l in x["listings"]}
     t0 = time.monotonic()
     for k, s in enumerate(searches):
         if time.monotonic() - t0 > budget_s:
@@ -735,9 +917,25 @@ def run_saved_search_alerts(db, user_id, profile, rows=None, budget_s: float = A
             sig = json.dumps([prefs, roles], sort_keys=True, default=str)
             res = memo.get(sig)
             if res is None:
+                # the employer jobs this search would fetch on the page (its own roles and places), on top of the standing pool
+                patch = s.get("patch") if isinstance(s.get("patch"), dict) else {}
+                query = {"roles": roles, "loc": patch.get("locations") if isinstance(patch.get("locations"), str) else "",
+                         "modes": patch.get("modes") if isinstance(patch.get("modes"), list) else [],
+                         "keywords": [w for w in (patch.get("keywords") or []) + (patch.get("rankKeywords") or []) if isinstance(w, str)]}
+                listings = x["listings"]
+                if roles or query["loc"] or query["modes"] or query["keywords"]:
+                    want = feed_want(x["prof"], x["entries"], base, query)
+                    wsig = json.dumps(want, sort_keys=True)
+                    extra = feed_memo.get(wsig)
+                    if extra is None:
+                        extra = feed_memo[wsig] = [d for d in feed_dicts(db, want, limit=FEED_SERVER_LIMIT, since=alert_since) if d["id"] not in have_ids]
+                    if extra:
+                        listings = listings + extra
+                        for d in extra:
+                            pool_ids.add(str(d["id"]))
                 opts = dict(x["opts"])
                 opts["queryRoles"] = roles
-                res = memo[sig] = JE.analyze_pool(x["listings"], x["prof"], x["entries"], prefs, x["learned"], opts)
+                res = memo[sig] = JE.analyze_pool(listings, x["prof"], x["entries"], prefs, x["learned"], opts)
             try:
                 min_fit = max(40, min(100, int(s.get("minFit") or ALERT_MIN_FIT)))
             except (TypeError, ValueError, OverflowError):
