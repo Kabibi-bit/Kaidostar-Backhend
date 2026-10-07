@@ -33,4 +33,18 @@ services:
       # Unset = nobody can; those listings reach every user's Job Search pool.
       - key: KAIDOSTAR_ADMIN_USER_IDS
         sync: false
+      # Employer career-site feeds (Greenhouse, Lever, Ashby, SmartRecruiters, Workable,
+      # Recruitee). A long random secret; a free pinger calls /feeds/tick?key=<it> every
+      # 10 minutes to keep the crawl going (and, on the free plan, the service awake).
+      # Unset = the endpoint is off (the crawl still runs while the service is awake).
+      - key: FEED_TICK_KEY
+        sync: false
+      # Stop adding employer jobs when the database reaches this size (Supabase free = 500 MB).
+      - key: FEED_DB_CEILING_MB
+        value: "400"
+      # Optional: federal jobs from USAJOBS (free key from developer.usajobs.gov).
+      - key: USAJOBS_API_KEY
+        sync: false
+      - key: USAJOBS_EMAIL
+        sync: false
  
