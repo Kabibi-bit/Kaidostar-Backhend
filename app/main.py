@@ -52,7 +52,7 @@ _ROUTE_MODULES = [
     "notifications", "career_discovery", "outreach", "social", "athletics",
     "market_research", "resume", "assistance", "strategy", "engagement",
     "dismissed_listings", "workshop", "ai_assist", "metis_store", "mission",
-    "interview",
+    "interview", "feeds",
 ]
 # Records the load result of every router so it can be inspected at
 # /system/router-status in the browser - no need to dig through logs to see
