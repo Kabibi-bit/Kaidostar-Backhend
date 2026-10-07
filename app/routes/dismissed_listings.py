@@ -41,15 +41,21 @@ def dismiss_listing(payload: DismissIn, db: Session = Depends(get_db), authoriza
     )
     if existing:
         return {"status": "already dismissed"}
+    from app.models.db_models import Listing as _Listing
+    if not db.query(_Listing.id).filter(_Listing.id == payload.listing_id).first():
+        # the job is already gone (its employer took it down): nothing left to hide
+        return {"status": "gone"}
  
     dismissed = DismissedListing(user_id=payload.user_id, listing_id=payload.listing_id)
     db.add(dismissed)
     try:
         db.commit()
     except IntegrityError:
-        # Lost a race with a concurrent dismiss of the same (user, listing);
-        # mirror the "already dismissed" early return rather than 500.
+        # Lost a race: a concurrent dismiss of the same (user, listing), or the job was removed
+        # at that very moment - either way it's out of the feed, rather than a 500.
         db.rollback()
+        if not db.query(_Listing.id).filter(_Listing.id == payload.listing_id).first():
+            return {"status": "gone"}
         return {"status": "already dismissed"}
     return {"status": "dismissed"}
  
