@@ -16,7 +16,6 @@ from app.services.auto_apply import (
     decide_auto_send,
     compute_sendable_at,
     create_application_for_match,
-    decide_application_delivery,
 )
 from app.services.timeutil import utcnow, to_naive_utc
  
@@ -28,74 +27,16 @@ def _candidate_dict(db, user_id):
     form, drawn from the user's account + current profile. Never invents data -
     a missing field stays empty, and the form filler (server-side submitter or the
     browser extension) safely hands off any form that needs what we don't have."""
-    from app.models.db_models import Profile, User
-    user = db.query(User).filter(User.id == user_id).first()
-    profile = (
-        db.query(Profile)
-        .filter(Profile.user_id == user_id, Profile.is_current == True)  # noqa: E712
-        .first()
-    )
-    email = (user.email if user else "") or ""
-    full_name = ((profile.full_name if profile else "") or "").strip()
-    phone = ((profile.phone if profile else "") or "").strip()
-    first, last = "", ""
-    if full_name:
-        parts = full_name.split()
-        first, last = parts[0], (parts[-1] if len(parts) > 1 else "")
-    return {"full_name": full_name, "first_name": first, "last_name": last, "email": email, "phone": phone}
+    from app.services import auto_runner as AR
+    return AR.candidate_identity(db, user_id, AR._profile(db, user_id))
  
  
-def _build_resume_docx(db, user_id):
-    """Generate a real .docx resume from the user's resume entries, or None if
-    they have none (or generation fails). Same content the in-app resume download
-    produces - never fabricates entries."""
-    from app.models.db_models import Profile, ResumeEntry, User
-    try:
-        entries = (
-            db.query(ResumeEntry)
-            .filter(ResumeEntry.user_id == user_id)
-            .order_by(ResumeEntry.display_order.asc())
-            .all()
-        )
-        if not entries:
-            return None
-        user = db.query(User).filter(User.id == user_id).first()
-        profile = (
-            db.query(Profile)
-            .filter(Profile.user_id == user_id, Profile.is_current == True)  # noqa: E712
-            .first()
-        )
-        email = (user.email if user else "") or ""
-        from app.services.resume_docx import generate_resume_document
-        polished = [{
-            "title": e.title or "",
-            "org": e.org or "",
-            "dates": " - ".join(x for x in [e.start_date, e.end_date] if x),
-            "bullets": [e.raw_description] if e.raw_description else [],
-        } for e in entries]
-        skills = [s.strip() for s in ((profile.skills if profile else "") or "").replace(",", " ").split() if s.strip()]
-        return generate_resume_document(email, None, polished, skills)
-    except Exception as e:
-        _log.warning("Could not build a resume file - %s", e)
-        return None
- 
- 
-def _applicant_context(db, user_id):
-    """Assemble the real applicant data used to fill a web application form for
-    server-side Pro auto-submit: a candidate dict (name/email/phone) and, when the
-    user has real resume entries, a generated .docx resume file to upload. Returns
-    (candidate, resume_path_or_None). resume_path, if returned, is a temp file the
-    caller must delete."""
-    import os as _os
-    import tempfile
-    candidate = _candidate_dict(db, user_id)
-    resume_path = None
-    data = _build_resume_docx(db, user_id)
-    if data:
-        fd, resume_path = tempfile.mkstemp(suffix=".docx")
-        with _os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-    return candidate, resume_path
+def _build_resume_docx(db, user_id, pkg_resume=None):
+    """The .docx that goes with an application: the person's own resume - the saved Resume Studio
+    version Auto picked for this job when it picked one, else their current resume - with the
+    posting's skills first. Never adds anything. None when they have no resume at all."""
+    from app.services import auto_runner as AR
+    return AR.resume_docx(db, user_id, AR._profile(db, user_id), pkg_resume)
  
  
 def _require_autosubmit_access(db, app_record):
@@ -122,169 +63,27 @@ def _require_autosubmit_access(db, app_record):
  
 def deliver_accepted_application(db, app_record, listing, client=None, unattended: bool = False):
     """The single REAL delivery path for an accepted application, shared by the
-    manual /send route AND the scheduler's unattended auto-send, so both deliver
-    identically and NEITHER ever marks an application 'sent' without a real send.
+    manual /send route AND Auto's unattended send (auto_runner.deliver_due), so both
+    deliver identically and NEITHER ever marks an application 'sent' without a real send.
  
-    Metis picks the most effective real channel for the listing:
-      - email: sends a real email to a best-effort general company address; on
-        success -> sent(email); on failure -> honest web hand-off (ready_to_submit).
-      - web: Pro + consent gets a real, safety-first browser auto-submission
-        (sent(web_auto) ONLY on a confirmed submission); everyone else, and any form
-        that can't be auto-completed safely, gets the honest hand-off
-        (ready_to_submit) with the real reason.
+    The decision is deterministic and explained (no AI picks the channel, and no
+    company address is ever guessed): a job board that forbids automation, a missing
+    consent, a closed job, a question the person's answer bank doesn't cover - each
+    becomes a ready-to-submit hand-off with the reason. A send happens only to the
+    address the posting itself gives (when it's plainly the company's), or through a
+    browser submission that sees the employer's confirmation - and keeps the proof."""
+    from app.services.auto_runner import deliver_application
+    return deliver_application(db, app_record, listing, client, unattended=unattended)
  
-    Mutates app_record and commits, and returns the same result dict the route
-    returns. Meters the paid Metis call and the auto-submit so the scheduler's bulk
-    path is bounded exactly like the manual one. Never raises for a delivery outcome
-    - a blocker or failure becomes a hand-off, not an exception.
  
-    unattended=True (the scheduler's auto-send): a listing that was added by hand
-    rather than pulled from a job source is never emailed or auto-submitted - its
-    contact address and form weren't vetted by any source, so the person submits it."""
-    from app.services.tiers import tier_has_feature, get_user_tier
-    from app.services.email_send import send_email
-    from app.models.db_models import Profile as Profile_
-    from app.services.application_submit import submit_application_via_browser
-    from app.services.job_search import HAND_ADDED_SOURCES
- 
-    if unattended and (getattr(listing, "source", None) or "") in HAND_ADDED_SOURCES:
-        app_record.status = "ready_to_submit"
-        app_record.sent_channel = "web"
-        db.commit()
-        return {
-            "status": "ready_to_submit", "channel": "web",
-            "apply_url": listing.apply_url, "draft_content": app_record.draft_content,
-            "reasoning": "This listing was added by hand rather than found by a job source, so Kaidostar doesn't send it for you - submit it at the posting.",
-        }
- 
-    # A job read from an employer's own career site that Kaidostar can no longer vouch for (the
-    # employer's feed stopped listing it, its closing date passed, or the feed couldn't be read for
-    # days) is never emailed or auto-submitted - by Auto or by a click. Nothing paid runs for it; the
-    # finished application is handed back so the person can check the posting and decide.
-    from app.services.feed_common import listing_closed, closed_note
-    closed = listing_closed(db, listing)
-    if closed is not None:
-        app_record.status = "ready_to_submit"
-        app_record.sent_channel = "web"
-        db.commit()
-        return {
-            "status": "ready_to_submit", "channel": "web", "posting_closed": True,
-            "apply_url": listing.apply_url, "draft_content": app_record.draft_content,
-            "reasoning": closed_note(closed),
-        }
- 
-    # This function owns the paid work (the Metis channel call, the auto-submit) AND
-    # its metering, so callers just hand it the application - they don't fetch a
-    # client or meter themselves. Fetch the AI client here when one wasn't supplied.
-    if client is None:
-        client = get_client()
- 
-    # Meter the paid Metis channel decision (fails open); mirrors the manual route.
-    rate_limit_by_tier(db, str(app_record.user_id), "application-send", per_action_limit=200)
- 
-    from app.services.feed_common import listing_text
-    listing_dict = {
-        "title": listing.title, "org": listing.org, "type": listing.type,
-        "description": listing_text(db, listing), "apply_url": listing.apply_url,
-    }
-    plan = {"channel": "web", "to_address": None, "subject": "", "reasoning": ""}
-    if client is not None:
-        try:
-            plan = decide_application_delivery(client, listing_dict)
-        except Exception as e:
-            _log.warning("Delivery-channel decision failed, defaulting to web hand-off - %s", e)
- 
-    def _web_handoff(reasoning, email_error=False, pro_only=False, auto_note=None, consent_needed=False, possibly_submitted=False):
-        app_record.status = "ready_to_submit"
-        app_record.sent_channel = "web"
-        db.commit()
-        out = {
-            "status": "ready_to_submit", "channel": "web",
-            "apply_url": listing.apply_url, "draft_content": app_record.draft_content,
-            "reasoning": reasoning,
-        }
-        if email_error:
-            out["email_error"] = True
-        if pro_only:
-            out["auto_submit_pro_only"] = True
-        if consent_needed:
-            out["auto_submit_consent_needed"] = True
-        if auto_note:
-            out["auto_submit_note"] = auto_note
-        if possibly_submitted:
-            out["auto_submit_possibly_sent"] = True
-        return out
- 
-    if plan.get("channel") == "email" and plan.get("to_address"):
-        subject = plan.get("subject") or f"Application: {listing.title} at {listing.org}"
-        body = (app_record.draft_content or "").strip() or "Please find my application below."
-        try:
-            send_email(plan["to_address"], subject, body)
-        except Exception as e:
-            _log.warning("Application email send failed, falling back to web hand-off - %s", e)
-            return _web_handoff(
-                "Couldn't send the email just now, so here's the finished application to submit at the posting directly.",
-                email_error=True,
-            )
-        app_record.status = "sent"
-        app_record.sent_at = utcnow()
-        app_record.sent_channel = "email"
-        app_record.sent_to_address = plan["to_address"]
-        db.commit()
-        return {
-            "status": "sent", "channel": "email",
-            "sent_at": app_record.sent_at.isoformat(),
-            "to_address": plan["to_address"], "address_is_guess": True,
-            "reasoning": plan.get("reasoning", ""),
-        }
- 
-    # Web channel: Pro members get a real best-effort browser auto-submission first;
-    # free members (and any form that can't be auto-completed safely) get the hand-off.
-    reasoning = plan.get("reasoning", "")
-    if not tier_has_feature(get_user_tier(db, str(app_record.user_id)), "auto_submit"):
-        return _web_handoff(reasoning, pro_only=True)
-    _profile = (
-        db.query(Profile_)
-        .filter(Profile_.user_id == app_record.user_id, Profile_.is_current == True)  # noqa: E712
-        .first()
-    )
-    if not (_profile and getattr(_profile, "auto_submit_consent", False)):
-        return _web_handoff(reasoning, consent_needed=True,
-                            auto_note="Give Kaidostar permission to submit applications for you to turn on automatic submission.")
-    rate_limit_by_tier(db, str(app_record.user_id), "application-autosubmit", per_action_limit=40)
-    candidate, resume_path = _applicant_context(db, app_record.user_id)
+def _package_extra(db, app_record):
+    """What an Auto package adds to a delivery or list response (best-effort)."""
     try:
-        result = submit_application_via_browser(
-            listing.apply_url, candidate,
-            resume_path=resume_path, cover_letter=app_record.draft_content,
-        )
-    except Exception as e:
-        _log.warning("Auto-submit crashed, handing off - %s", e)
-        result = {"status": "error", "reason": str(e)}
-    finally:
-        if resume_path:
-            try:
-                os.remove(resume_path)
-            except Exception:
-                pass
- 
-    if result.get("status") == "submitted":
-        app_record.status = "sent"
-        app_record.sent_at = utcnow()
-        app_record.sent_channel = "web_auto"
-        db.commit()
-        return {
-            "status": "sent", "channel": "web_auto",
-            "sent_at": app_record.sent_at.isoformat(),
-            "apply_url": listing.apply_url,
-            "reasoning": reasoning,
-            "auto_submit_note": result.get("reason", ""),
-        }
-    return _web_handoff(
-        reasoning,
-        auto_note=result.get("reason", ""),
-        possibly_submitted=bool(result.get("submitted_unconfirmed")),
-    )
+        from app.services import auto_runner as AR
+        pkg = AR.load_package(db, app_record.user_id, app_record.id)
+    except Exception:
+        return None
+    return pkg
  
  
 router = APIRouter(prefix="/applications", tags=["applications"])
@@ -503,11 +302,39 @@ def list_applications(user_id: str, db: Session = Depends(get_db), _auth: dict =
     # open says so on its Workshop card (the card shows send_reasoning) - one query for all of them.
     from app.services.feed_common import closed_by_listing, closed_note
     closed = closed_by_listing(db, [l for a, l in rows if a.status == "ready_to_submit"])
+    # Auto's packages: why a hand-off happened (and whether it may already have gone through)
+    try:
+        from app.services.auto_runner import packages_for
+        pkgs = packages_for(db, user_id)
+    except Exception:
+        db.rollback()
+        pkgs = {}
+ 
+    def _route(url):
+        try:
+            from app.services.auto_runner import route_of
+            return route_of(url)[0]
+        except Exception:
+            return None
  
     def _closed_extra(a, l):
+        # where the apply link goes ("employer" hiring system, "company_site", "aggregator" job board) - the
+        # extension never opens a job board's form for you
+        out = {"apply_route": _route(l.apply_url)}
+        pkg = pkgs.get(str(a.id))
+        if isinstance(pkg, dict):
+            if not pkg.get("manual"):
+                out["auto_prepared"] = True
+            ho = pkg.get("handoff") if isinstance(pkg.get("handoff"), dict) else None
+            if a.status == "ready_to_submit" and ho:
+                out["send_reasoning"] = str(ho.get("why") or "")[:400]
+                if ho.get("possiblySent"):
+                    out["auto_submit_possibly_sent"] = True
         c = closed.get(str(l.id)) if a.status == "ready_to_submit" else None
-        # a standing heads-up, not a cause: the hand-off may have happened earlier for another reason
-        return {"send_reasoning": closed_note(c, sent=False), "posting_closed": True} if c is not None else {}
+        if c is not None:
+            # a standing heads-up, not a cause: the hand-off may have happened earlier for another reason
+            out.update({"send_reasoning": closed_note(c, sent=False), "posting_closed": True})
+        return out
  
     return [
         {
@@ -561,8 +388,20 @@ def approve_application(application_id: str, db: Session = Depends(get_db), auth
     if not app_record:
         raise HTTPException(status_code=404, detail="Application not found")
     verify_token_belongs_to_user(str(app_record.user_id), authorization)
+    # an application that has gone out (or is going out right now) is never re-approved - that
+    # would queue the same application to be sent a second time
+    if app_record.status == "sent":
+        raise HTTPException(status_code=409, detail="This application has already been sent.")
+    if app_record.status == "sending":
+        raise HTTPException(status_code=409, detail="This application is being sent right now.")
+    _refuse_if_maybe_sent(db, app_record)
     app_record.status = "approved"
     app_record.sendable_at = compute_sendable_at()
+    try:
+        from app.services.auto_runner import note_person_approved
+        note_person_approved(db, app_record, app_record.sendable_at)
+    except Exception:
+        pass
     db.commit()
     return {"status": "approved", "sendable_at": app_record.sendable_at.isoformat()}
  
@@ -570,19 +409,13 @@ def approve_application(application_id: str, db: Session = Depends(get_db), auth
 @router.post("/{application_id}/send")
 def send_application(application_id: str, db: Session = Depends(get_db), authorization: str = Header(None)):
     """Delivers an accepted application for real - only if approved and the
-    undo window has passed.
+    undo window has passed (or a retry of one that was handed back).
  
-    Metis picks the most effective real channel for the listing:
-      - "email": the app sends the accepted application to a best-effort
-        general company address via Resend (a real email). status -> "sent".
-      - "web": an arbitrary job site's form cannot be auto-submitted, so the
-        real route is the posting's own apply_url; the finished application is
-        handed back for the user to submit there. status -> "ready_to_submit"
-        (the user confirms via /mark-submitted once they've actually applied).
- 
-    It never claims a submission it didn't make, and never emails a fabricated
-    named person - only a general, best-effort company address, and only when
-    Metis judges a direct email genuinely more effective than the real posting.
+    Deterministic and explained (deliver_accepted_application): sent only to the
+    address the posting itself gives when it's plainly the company's, or by a
+    browser submission that sees the employer's confirmation (proof kept) - and
+    otherwise handed back ready to submit, with the reason. It never claims a
+    submission it didn't make and never emails a guessed address.
     """
     from app.models.db_models import Listing
     import uuid as uuid_module
@@ -597,8 +430,11 @@ def send_application(application_id: str, db: Session = Depends(get_db), authori
     # "approved" is a fresh send; "ready_to_submit" is a retry of a delivery that
     # previously fell back to the hand-off (e.g. the user has now granted consent),
     # so allow it to re-attempt without going back through the undo window.
+    if app_record.status == "sending":
+        raise HTTPException(status_code=409, detail="This application is being sent right now.")
     if app_record.status not in ("approved", "ready_to_submit"):
         raise HTTPException(status_code=400, detail="Application is not approved yet")
+    _refuse_if_maybe_sent(db, app_record)
     if app_record.status == "approved":
         # Coerce the DB value to naive UTC: sendable_at is TIMESTAMPTZ, so psycopg2
         # reads it back tz-aware, and comparing/subtracting it against the naive
@@ -613,10 +449,18 @@ def send_application(application_id: str, db: Session = Depends(get_db), authori
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
  
-    # The real, shared delivery path (also used by the scheduler's auto-send). It
-    # fetches the AI client, meters the paid Metis call, picks the channel, actually
-    # sends or hands off, and never marks 'sent' without a real send.
+    # The real, shared delivery path (also used by Auto's unattended send). It
+    # actually sends or hands off, and never marks 'sent' without a real send.
     return deliver_accepted_application(db, app_record, listing)
+ 
+ 
+def _refuse_if_maybe_sent(db, app_record):
+    """An application that may already have reached the employer is never sent, approved or submitted again until
+    you say it didn't go through (the Auto page, or the extension's panel)."""
+    pkg = _package_extra(db, app_record) or {}
+    ho = pkg.get("handoff") if isinstance(pkg.get("handoff"), dict) else {}
+    if app_record.status == "ready_to_submit" and ho.get("possiblySent"):
+        raise HTTPException(status_code=409, detail="This application may already have gone through - check the posting (or your email). If it didn't, choose “It didn’t go through” on the Auto page first.")
  
  
 @router.post("/{application_id}/mark-submitted")
@@ -638,12 +482,40 @@ def mark_application_submitted(application_id: str, db: Session = Depends(get_db
     verify_token_belongs_to_user(str(app_record.user_id), authorization)
     if app_record.status not in ("ready_to_submit", "approved"):
         raise HTTPException(status_code=400, detail="Application is not ready to submit")
-    app_record.status = "sent"
-    app_record.sent_at = utcnow()
-    if not app_record.sent_channel:
-        app_record.sent_channel = "web"
+    if not _mark_sent_once(db, app_record, app_record.sent_channel or "web"):
+        raise HTTPException(status_code=409, detail="This application was just sent (or is being sent) - refresh to see it.")
+    _package_sent(db, app_record, {"by": "you", "url": None})
     db.commit()
     return {"status": "sent", "sent_at": app_record.sent_at.isoformat(), "channel": app_record.sent_channel}
+ 
+ 
+def _mark_sent_once(db, app_record, channel) -> bool:
+    """approved / ready_to_submit -> sent, in one conditional update, so an unattended send and a
+    confirmation from your browser can never both record the same application."""
+    now = utcnow()
+    n = (db.query(Application)
+         .filter(Application.id == app_record.id, (Application.status == "ready_to_submit") | (Application.status == "approved"))
+         .update({Application.status: "sent", Application.sent_at: now, Application.sent_channel: channel}, synchronize_session=False))
+    if n != 1:
+        db.rollback()
+        return False
+    app_record.status, app_record.sent_at, app_record.sent_channel = "sent", now, channel
+    return True
+ 
+ 
+def _package_sent(db, app_record, proof):
+    """Record a send on the application's Auto package (sent date, proof, follow-up date). Best-effort."""
+    try:
+        from app.services import auto_runner as AR
+        pkg = AR.load_package(db, app_record.user_id, app_record.id)
+        if pkg is None:
+            return
+        rules = AR.rules_of(AR._profile(db, app_record.user_id))
+        AR._attempt(pkg, app_record.sent_channel or "web", "sent", "Sent", proof)
+        AR.mark_sent_package(pkg, rules, AR._ms(app_record.sent_at) or AR._now_ms(), proof, app_record.sent_channel)
+        AR.save_package(db, app_record.user_id, app_record.id, pkg)
+    except Exception:
+        pass
  
  
 @router.get("/{application_id}/autofill")
@@ -675,15 +547,58 @@ def application_autofill_data(application_id: str, db: Session = Depends(get_db)
         raise HTTPException(status_code=404, detail="Application not found")
     verify_token_belongs_to_user(str(app_record.user_id), authorization)
     _require_autosubmit_access(db, app_record)
+    if app_record.status == "sent":
+        raise HTTPException(status_code=409, detail="This application was already sent.")
+    if app_record.status == "sending":
+        raise HTTPException(status_code=409, detail="Kaidostar is sending this application right now.")
+    if app_record.status not in ("approved", "ready_to_submit"):
+        raise HTTPException(status_code=400, detail="Approve this application first.")
  
     listing = db.query(Listing).filter(Listing.id == app_record.listing_id).first()
     if not listing:
         raise HTTPException(status_code=404, detail="Listing not found")
+    from app.services import auto_runner as AR
+    # a job board's own apply form is never filled or submitted for you - those sites forbid it
+    route, host = AR.route_of(listing.apply_url)
+    if route == "aggregator":
+        raise HTTPException(status_code=409, detail=(host or "This") + " is a job board, and the extension never fills a job board's own form - apply there yourself (your answers are on the Auto page: Copy my answers).")
+    # a submit whose result was never seen may already have reached the employer: never opened for a second go
+    pkg0 = _package_extra(db, app_record) or {}
+    ho0 = pkg0.get("handoff") if isinstance(pkg0.get("handoff"), dict) else {}
+    if ho0.get("possiblySent"):
+        raise HTTPException(status_code=409, detail="This application may already have gone through - check the posting (or your email). If it didn't, choose “It didn’t go through” on the Auto page, then open it again.")
+ 
+    if app_record.status == "approved":
+        # you're submitting it in your browser now: the unattended send must not also deliver it
+        n = (db.query(Application).filter(Application.id == app_record.id, Application.status == "approved")
+             .update({Application.status: "ready_to_submit", Application.sent_channel: "web"}, synchronize_session=False))
+        db.commit()
+        if n != 1:
+            raise HTTPException(status_code=409, detail="Kaidostar is sending this application right now.")
+        app_record.status = "ready_to_submit"
+        try:
+            from app.services import auto_runner as AR
+            pkg = AR.load_package(db, app_record.user_id, app_record.id)
+            if pkg is not None:
+                pkg["handoff"] = {"key": "extension_opened", "why": "Opened in the Kaidostar Apply extension - finish it there, or at the posting.", "possiblySent": False}
+                AR.save_package(db, app_record.user_id, app_record.id, pkg)
+                db.commit()
+        except Exception:
+            db.rollback()
  
     candidate = _candidate_dict(db, app_record.user_id)
     has_resume = (
         db.query(ResumeEntry).filter(ResumeEntry.user_id == app_record.user_id).first() is not None
     )
+    pkg = _package_extra(db, app_record) or {}
+    if not has_resume and (pkg.get("resume") or {}).get("source") == "version":
+        has_resume = True   # a saved Resume Studio version is a resume too
+    try:
+        from app.services import auto_runner as AR
+        AR.note_extension_seen(db, app_record.user_id)
+        policy = AR.rules_of(AR._profile(db, app_record.user_id)).get("coverLetter", "asked")
+    except Exception:
+        policy = "asked"
     return {
         "application_id": str(app_record.id),
         "first_name": candidate["first_name"],
@@ -697,7 +612,107 @@ def application_autofill_data(application_id: str, db: Session = Depends(get_db)
         "listing_org": listing.org,
         "resume_available": has_resume,
         "resume_url": f"/applications/{app_record.id}/resume-file" if has_resume else None,
+        # the form's other questions are answered only from the person's own answer bank
+        "answers_url": f"/applications/{app_record.id}/answers",
+        # a cover letter is written on request only (when the form asks for one), never by default
+        "cover_letter_policy": policy,
+        "cover_letter_url": f"/applications/{app_record.id}/cover-letter",
+        "resume_note": " ".join((pkg.get("resume") or {}).get("changes") or [])[:400],
+        # where the extension may submit on its own (an employer's hiring system); elsewhere the click is yours
+        "ats_domains": _ats_domains(),
+        # job boards: the extension never fills or submits there, even if a link leads to one
+        "board_domains": _board_domains(),
+        # the extension tells Kaidostar right before it clicks submit, so a result it never sees isn't retried
+        "attempt_url": f"/applications/{app_record.id}/submit-attempt",
     }
+ 
+ 
+def _ats_domains() -> list:
+    try:
+        from app.services import job_engine as JE
+        return [str(d) for d in (JE.TAX.get("ats_domains") or [])][:60]
+    except Exception:
+        return []
+ 
+ 
+def _board_domains() -> list:
+    try:
+        from app.services import job_engine as JE
+        return [str(d) for d in (JE.TAX.get("aggregator_domains") or [])][:60]
+    except Exception:
+        return []
+ 
+ 
+@router.post("/{application_id}/submit-attempt")
+def application_submit_attempt(application_id: str, db: Session = Depends(get_db), authorization: str = Header(None)):
+    """The extension calls this right BEFORE it clicks the form's submit button. If it then never sees the
+    result (the page moved on, the tab closed, the browser crashed), the application is already marked "may
+    have gone through": Kaidostar won't open it again for you, and tells you to check before resubmitting.
+    A confirmed submission afterwards records it as sent, as usual. Same Pro + consent gate as autofill."""
+    from app.models.db_models import Listing
+    from app.services import auto_runner as AR
+    import uuid as uuid_module
+    try:
+        uuid_module.UUID(application_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Application not found")
+    app_record = db.query(Application).filter(Application.id == application_id).first()
+    if not app_record:
+        raise HTTPException(status_code=404, detail="Application not found")
+    verify_token_belongs_to_user(str(app_record.user_id), authorization)
+    _require_autosubmit_access(db, app_record)
+    if app_record.status in ("sent", "sending"):
+        raise HTTPException(status_code=409, detail="This application was already sent.")
+    if app_record.status not in ("approved", "ready_to_submit"):
+        raise HTTPException(status_code=400, detail="Approve this application first.")
+    if app_record.status == "approved":
+        # submitting in your browser now: the unattended send must not also deliver it
+        n = (db.query(Application).filter(Application.id == app_record.id, Application.status == "approved")
+             .update({Application.status: "ready_to_submit", Application.sent_channel: "web"}, synchronize_session=False))
+        db.commit()
+        if n != 1:
+            raise HTTPException(status_code=409, detail="Kaidostar is sending this application right now.")
+        app_record.status = "ready_to_submit"
+    listing = db.query(Listing).filter(Listing.id == app_record.listing_id).first()
+    pkg = AR.load_package(db, app_record.user_id, app_record.id) or AR._manual_pkg(app_record, listing)
+    ho = pkg.get("handoff") if isinstance(pkg.get("handoff"), dict) else {}
+    if ho.get("possiblySent"):
+        # one submit whose result nobody saw is enough: a second (another tab, a second run) could send it twice
+        raise HTTPException(status_code=409, detail="This application may already have gone through - check the posting (or your email). If it didn't, choose “It didn’t go through” first.")
+    AR._attempt(pkg, "web_ext", "clicked", "Submit clicked in the Kaidostar Apply extension - waiting for the page to confirm it")
+    pkg["handoff"] = {"key": "extension_clicked", "possiblySent": True,
+                      "why": "Submitted from the Kaidostar Apply extension, but its confirmation wasn't seen - check the posting (or your email) before submitting again."}
+    AR.save_package(db, app_record.user_id, app_record.id, pkg)
+    db.commit()
+    return {"ok": True}
+ 
+ 
+@router.post("/{application_id}/not-sent")
+def application_not_sent(application_id: str, db: Session = Depends(get_db), authorization: str = Header(None)):
+    """You checked: an application Kaidostar flagged as "may have gone through" did not. The flag is cleared,
+    so you (or the extension) can submit it again. Only you can say this - Kaidostar never clears it itself."""
+    from app.services import auto_runner as AR
+    import uuid as uuid_module
+    try:
+        uuid_module.UUID(application_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Application not found")
+    app_record = db.query(Application).filter(Application.id == application_id).first()
+    if not app_record:
+        raise HTTPException(status_code=404, detail="Application not found")
+    verify_token_belongs_to_user(str(app_record.user_id), authorization)
+    if app_record.status != "ready_to_submit":
+        raise HTTPException(status_code=409 if app_record.status in ("sent", "sending") else 400,
+                            detail="This application was already sent." if app_record.status in ("sent", "sending") else "This application isn't waiting to be submitted.")
+    pkg = AR.load_package(db, app_record.user_id, app_record.id)
+    ho = pkg.get("handoff") if isinstance(pkg, dict) and isinstance(pkg.get("handoff"), dict) else None
+    if ho and ho.get("possiblySent"):
+        ho["possiblySent"] = False
+        ho["why"] = "You checked - it didn't go through. Ready for you to submit."
+        AR._attempt(pkg, "check", "not_sent", "You said it didn't go through")
+        AR.save_package(db, app_record.user_id, app_record.id, pkg)
+        db.commit()
+    return {"ok": True}
  
  
 @router.get("/{application_id}/resume-file")
@@ -719,7 +734,8 @@ def application_resume_file(application_id: str, db: Session = Depends(get_db), 
     verify_token_belongs_to_user(str(app_record.user_id), authorization)
     _require_autosubmit_access(db, app_record)
  
-    data = _build_resume_docx(db, app_record.user_id)
+    pkg = _package_extra(db, app_record) or {}
+    data = _build_resume_docx(db, app_record.user_id, pkg.get("resume"))
     if not data:
         raise HTTPException(status_code=404, detail="No résumé on file to attach")
     return Response(
@@ -729,8 +745,15 @@ def application_resume_file(application_id: str, db: Session = Depends(get_db), 
     )
  
  
+class SubmitProofIn(BaseModel):
+    url: str | None = Field(default=None, max_length=1000)
+    phrase: str | None = Field(default=None, max_length=200)
+    answered: int | None = Field(default=None, ge=0, le=200)
+    answers: list | None = Field(default=None, max_length=40)   # [{label, answer}] - what the form was told
+ 
+ 
 @router.post("/{application_id}/confirm-autofill-submit")
-def confirm_autofill_submit(application_id: str, db: Session = Depends(get_db), authorization: str = Header(None)):
+def confirm_autofill_submit(application_id: str, payload: SubmitProofIn | None = None, db: Session = Depends(get_db), authorization: str = Header(None)):
     """The extension calls this ONLY after it has verified a real submission
     happened in the browser (a genuine post-submit change - URL moved to a
     confirmation page or a confirmation message newly appeared - via
@@ -753,10 +776,22 @@ def confirm_autofill_submit(application_id: str, db: Session = Depends(get_db), 
     # part of the same paid, consented feature.
     _require_autosubmit_access(db, app_record)
     if app_record.status not in ("ready_to_submit", "approved"):
-        raise HTTPException(status_code=400, detail="Application is not ready to submit")
-    app_record.status = "sent"
-    app_record.sent_at = utcnow()
-    app_record.sent_channel = "web_ext"
+        raise HTTPException(status_code=409 if app_record.status in ("sent", "sending") else 400,
+                            detail="This application was already sent." if app_record.status in ("sent", "sending") else "Application is not ready to submit")
+    if not _mark_sent_once(db, app_record, "web_ext"):
+        raise HTTPException(status_code=409, detail="This application was already sent.")
+    proof = {"by": "extension"}
+    if payload is not None:
+        if isinstance(getattr(payload, "url", None), str) and payload.url.lower().startswith(("http://", "https://")):
+            proof["url"] = payload.url[:1000]
+        if isinstance(getattr(payload, "phrase", None), str):
+            proof["phrase"] = payload.phrase[:200]
+        if isinstance(getattr(payload, "answered", None), int):
+            proof["answered"] = payload.answered
+        if isinstance(getattr(payload, "answers", None), list):
+            proof["answers"] = [{"label": str(a.get("label") or "")[:120], "answer": str(a.get("answer") or "")[:120]}
+                                for a in payload.answers[:40] if isinstance(a, dict)]
+    _package_sent(db, app_record, proof)
     db.commit()
     return {"status": "sent", "sent_at": app_record.sent_at.isoformat(), "channel": "web_ext"}
  
@@ -774,9 +809,178 @@ def undo_application(application_id: str, db: Session = Depends(get_db), authori
     verify_token_belongs_to_user(str(app_record.user_id), authorization)
     if app_record.status == "sent":
         raise HTTPException(status_code=400, detail="Already sent, cannot undo")
+    if app_record.status == "sending":
+        raise HTTPException(status_code=409, detail="It's being sent right now - check back in a minute.")
     app_record.status = "undone"
     db.commit()
     return {"status": "undone"}
+ 
+ 
+@router.get("/{application_id}/package")
+def application_package(application_id: str, db: Session = Depends(get_db), authorization: str = Header(None)):
+    """What Auto put in this application and why: the resume it chose (and what it changed), the
+    cover-letter decision, the answers it still needs, every delivery attempt and the proof of a send."""
+    import uuid as uuid_module
+    try:
+        uuid_module.UUID(application_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Application not found")
+    app_record = db.query(Application).filter(Application.id == application_id).first()
+    if not app_record:
+        raise HTTPException(status_code=404, detail="Application not found")
+    verify_token_belongs_to_user(str(app_record.user_id), authorization)
+    pkg = _package_extra(db, app_record)
+    if pkg is None:
+        raise HTTPException(status_code=404, detail="This application wasn't prepared by Auto")
+    return pkg
+ 
+ 
+@router.get("/{application_id}/resume.docx")
+def application_resume_download(application_id: str, db: Session = Depends(get_db), authorization: str = Header(None)):
+    """The resume that goes with this application (the one Auto chose, skills ordered for the job),
+    for the person to download and submit themselves. Just theirs - no Pro or consent needed."""
+    from fastapi import Response
+    import uuid as uuid_module
+    try:
+        uuid_module.UUID(application_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Application not found")
+    app_record = db.query(Application).filter(Application.id == application_id).first()
+    if not app_record:
+        raise HTTPException(status_code=404, detail="Application not found")
+    verify_token_belongs_to_user(str(app_record.user_id), authorization)
+    pkg = _package_extra(db, app_record) or {}
+    data = _build_resume_docx(db, app_record.user_id, pkg.get("resume"))
+    if not data:
+        raise HTTPException(status_code=404, detail="No resume on file yet - add one in Resume Studio.")
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": "attachment; filename=resume.docx"},
+    )
+ 
+ 
+@router.post("/{application_id}/cover-letter")
+def application_cover_letter(application_id: str, db: Session = Depends(get_db), authorization: str = Header(None)):
+    """Write a cover letter for this application on request (the form asks for one, or the person
+    wants one). From the posting and their own words, checked for invented claims; replaces the
+    draft only while the application hasn't been sent."""
+    import uuid as uuid_module
+    from app.models.db_models import Listing
+    try:
+        uuid_module.UUID(application_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Application not found")
+    app_record = db.query(Application).filter(Application.id == application_id).first()
+    if not app_record:
+        raise HTTPException(status_code=404, detail="Application not found")
+    verify_token_belongs_to_user(str(app_record.user_id), authorization)
+    if app_record.status in ("sent", "sending", "undone"):
+        raise HTTPException(status_code=400, detail="This application can't be changed now.")
+    listing = db.query(Listing).filter(Listing.id == app_record.listing_id).first()
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    from app.services import auto_runner as AR
+    profile = AR._profile(db, app_record.user_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="No current profile for this user")
+    client = get_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="AI service is not configured. Please try again later.")
+    rate_limit_by_tier(db, str(app_record.user_id), "application-draft", per_action_limit=200)
+    pkg = _package_extra(db, app_record) or {}
+    cand = {"coverAsked": True, "skills": ((pkg.get("resume") or {}).get("moved") or [])}
+    res = AR.cover_letter_for(db, client, app_record.user_id, profile, listing, cand, AR.rules_of(profile), force=True)
+    if not res.get("text"):
+        raise HTTPException(status_code=502, detail="Couldn't write a cover letter just now. Please try again.")
+    app_record.draft_content = res["text"]
+    app_record.draft_flagged_terms = res["flagged"] or None
+    returned = False
+    if res["flagged"] and app_record.status == "approved":
+        # it mentions something that isn't in the posting or your profile: never sent before you've read it
+        app_record.status, app_record.sendable_at, returned = "pending_review", None, True
+    if pkg:
+        pkg["coverLetter"] = True
+        pkg["coverNote"] = res.get("note", "")
+        pkg["needs"] = [n for n in (pkg.get("needs") or []) if n.get("key") != "cover_letter"]
+        if returned:
+            pkg["approvedAt"] = None
+            pkg["needs"] = [n for n in pkg["needs"] if n.get("key") != "flagged"] + [{"key": "flagged", "why": "The new cover letter mentions " + ", ".join(res["flagged"][:3]) + ", which isn't in the posting or your profile - read it, then approve again"}]
+        AR.save_package(db, app_record.user_id, app_record.id, pkg)
+    db.commit()
+    return {"cover_letter": res["text"], "flagged_terms": res["flagged"], "status": app_record.status,
+            "review_note": ("It mentions " + ", ".join(res["flagged"][:3]) + ", which isn't in the posting or your profile - check it" +
+                            (" (it's back in Needs you until you approve it again)." if returned else ".")) if res["flagged"] else None}
+ 
+ 
+class QuestionsIn(BaseModel):
+    questions: list = Field(default_factory=list, max_length=80)
+ 
+ 
+@router.post("/{application_id}/answers")
+def application_answers(application_id: str, payload: QuestionsIn, db: Session = Depends(get_db), authorization: str = Header(None)):
+    """The extension sends the questions on an application form; this answers the ones the person's
+    own answer bank covers - and says, for the rest, why it won't. Same Pro + consent gate as autofill."""
+    import uuid as uuid_module
+    try:
+        uuid_module.UUID(application_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Application not found")
+    app_record = db.query(Application).filter(Application.id == application_id).first()
+    if not app_record:
+        raise HTTPException(status_code=404, detail="Application not found")
+    verify_token_belongs_to_user(str(app_record.user_id), authorization)
+    _require_autosubmit_access(db, app_record)
+    from app.services import auto_answers as AA
+    from app.services import auto_runner as AR
+    from app.models.db_models import Listing
+    qs = []
+    for q in (payload.questions or [])[:80]:
+        if not isinstance(q, dict):
+            qs.append({})
+            continue
+        qs.append({"label": str(q.get("label") or "")[:300], "type": str(q.get("type") or "text")[:20],
+                   "options": [str(o)[:200] for o in (q.get("options") if isinstance(q.get("options"), list) else [])[:60]],
+                   "required": bool(q.get("required")),
+                   # an answer the form picked by itself (no "Select..." placeholder, a pre-checked radio)
+                   "preset": bool(q.get("preset")), "current": str(q.get("current") or "")[:200]})
+    listing = db.query(Listing).filter(Listing.id == app_record.listing_id).first()
+    return {"answers": AA.resolve_all(qs, AR.load_answers(db, app_record.user_id), AR.job_country_of(db, listing))}
+ 
+ 
+class FollowUpIn(BaseModel):
+    done: bool = True
+    snooze_days: int = Field(default=0, ge=0, le=30)
+ 
+ 
+@router.post("/{application_id}/followed-up")
+def application_followed_up(application_id: str, payload: FollowUpIn, db: Session = Depends(get_db), authorization: str = Header(None)):
+    """Mark a sent application's follow-up done (you sent your note), or snooze the reminder."""
+    import uuid as uuid_module
+    try:
+        uuid_module.UUID(application_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Application not found")
+    app_record = db.query(Application).filter(Application.id == application_id).first()
+    if not app_record:
+        raise HTTPException(status_code=404, detail="Application not found")
+    verify_token_belongs_to_user(str(app_record.user_id), authorization)
+    from app.services import auto_runner as AR
+    pkg = _package_extra(db, app_record)
+    if pkg is None:
+        raise HTTPException(status_code=404, detail="This application wasn't prepared by Auto")
+    fu = pkg.get("followUp") if isinstance(pkg.get("followUp"), dict) else {}
+    now = AR._now_ms()
+    if payload.snooze_days and not payload.done:
+        fu.update({"dueAt": now + payload.snooze_days * AR.DAY_MS, "notifiedAt": None, "doneAt": None})
+    elif payload.done:
+        fu["doneAt"] = now
+    else:
+        fu["doneAt"] = None
+    pkg["followUp"] = fu
+    AR.save_package(db, app_record.user_id, app_record.id, pkg)
+    db.commit()
+    return {"followUp": fu}
  
  
 @router.get("/{application_id}/explain-outcome")
