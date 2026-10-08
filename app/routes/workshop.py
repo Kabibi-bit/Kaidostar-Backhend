@@ -1,4 +1,4 @@
-""Career Studio (Workshop) generic item store.
+"""Career Studio (Workshop) generic item store.
  
 Backs the frontend Workshop's new tools - STAR interview stories,
 references, networking contacts, portfolio links, achievements (brag
@@ -36,6 +36,11 @@ ALLOWED_KINDS = {
     # saved searches (+ alert bookkeeping) and applied-job ids.
     "job_search_state",
 }
+ 
+# Auto's own records (each application's package, the run log, the answer bank) live in the same
+# table but are written only by the server (app/services/auto_runner.py) - never through these
+# generic endpoints, and never listed with the Workshop's items (they'd crowd its 500-row window).
+SERVER_ONLY_KINDS = ("auto_package", "auto_state", "auto_answers")
  
 # Most kinds are short study-aid records; the Job Search state carries saved
 # searches and learned rules, so it gets a larger (still bounded) budget: the
@@ -94,6 +99,8 @@ def list_items(user_id: str, kind: str | None = None, db: Session = Depends(get_
         if kind not in ALLOWED_KINDS:
             raise HTTPException(status_code=400, detail="unknown kind")
         q = q.filter(WorkshopItem.kind == kind)
+    else:
+        q = q.filter(WorkshopItem.kind.notin_(SERVER_ONLY_KINDS))
     rows = q.order_by(desc(WorkshopItem.created_at)).limit(500).all()
     return [
         {"id": r.client_id, "kind": r.kind, "data": r.data or {}, "created_at": r.created_at.isoformat() if r.created_at else None}
@@ -135,7 +142,10 @@ def delete_item(user_id: str, client_id: str, kind: str | None = None, db: Sessi
     a kind. A no-match delete is a no-op, not an error, so a best-effort
     call for an item that only ever lived locally stays quiet."""
     _require_uuid(user_id)
-    q = db.query(WorkshopItem).filter(WorkshopItem.user_id == user_id, WorkshopItem.client_id == client_id)
+    if kind in SERVER_ONLY_KINDS:
+        raise HTTPException(status_code=400, detail="unknown kind")
+    q = db.query(WorkshopItem).filter(WorkshopItem.user_id == user_id, WorkshopItem.client_id == client_id,
+                                      WorkshopItem.kind.notin_(SERVER_ONLY_KINDS))
     if kind is not None:
         q = q.filter(WorkshopItem.kind == kind)
     deleted = q.delete()
