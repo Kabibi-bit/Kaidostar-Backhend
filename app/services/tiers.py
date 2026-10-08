@@ -110,7 +110,7 @@ FEATURE_DAILY_CAPS = {
 TIER_LIMITS = {
     "free": {"ai_actions_per_day": 10, "auto_drafts_per_day": 0},
     "pro": {"ai_actions_per_day": 250, "auto_drafts_per_day": 10},
-    "max": {"ai_actions_per_day": 5000, "auto_drafts_per_day": 5000},
+    "max": {"ai_actions_per_day": 5000, "auto_drafts_per_day": 50},   # Auto's own ceiling (auto_engine.TIER_DAILY_MAX)
 }
  
  
