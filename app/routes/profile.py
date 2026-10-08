@@ -25,7 +25,9 @@ class SurveyIn(BaseModel):
     location_pref: str | None = Field(default=None, max_length=200)
     full_name: str | None = Field(default=None, max_length=200)
     phone: str | None = Field(default=None, max_length=50)
-    auto_submit_consent: bool = False
+    # permission for Kaidostar to submit for you: only set when this save changes it (None = keep what's
+    # stored) - a profile saved from a device holding an old copy must never re-grant or revoke it
+    auto_submit_consent: bool | None = None
     target_types: list[str] = Field(max_length=50)
     is_athlete: bool = False
     sport: str | None = Field(default=None, max_length=100)
@@ -187,6 +189,8 @@ def create_profile(payload: SurveyIn, db: Session = Depends(get_db), authorizati
         .filter(Profile.user_id == payload.user_id, Profile.is_current == True)  # noqa: E712
         .first()
     )
+    if payload.auto_submit_consent is None:
+        profile_fields["auto_submit_consent"] = bool(getattr(_prev, "auto_submit_consent", False)) if _prev is not None else False
     if _prev is not None:
         profile_fields["auto_apply_enabled"] = _prev.auto_apply_enabled
         profile_fields["auto_apply_threshold"] = _prev.auto_apply_threshold
