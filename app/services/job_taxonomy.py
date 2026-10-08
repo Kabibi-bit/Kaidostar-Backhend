@@ -827,6 +827,20 @@ ATS_DOMAINS = [
 AGGREGATOR_DOMAINS = [
     "adzuna.com", "indeed.com", "linkedin.com", "ziprecruiter.com", "glassdoor.com", "simplyhired.com", "monster.com",
     "careerbuilder.com", "jooble.org", "talent.com", "lensa.com", "jobright.ai", "dice.com", "snagajob.com",
+    # the same boards on their national sites, and the big national boards
+    "indeed.co.uk", "indeed.ca", "indeed.de", "indeed.fr", "indeed.co.in", "indeed.com.au", "indeed.ie", "indeed.nl", "indeed.es",
+    "indeed.it", "indeed.com.br", "indeed.com.mx", "indeed.com.sg", "indeed.ch", "indeed.co.nz", "indeed.co.za", "indeed.jp",
+    "glassdoor.co.uk", "glassdoor.ca", "glassdoor.co.in", "glassdoor.com.au", "glassdoor.de", "glassdoor.fr", "glassdoor.ie", "glassdoor.nl",
+    "glassdoor.es", "glassdoor.it", "glassdoor.com.br", "glassdoor.com.mx", "glassdoor.sg", "glassdoor.ch", "glassdoor.co.nz", "glassdoor.com.hk",
+    "glassdoor.be", "glassdoor.at",
+    "monster.co.uk", "monster.ca", "monster.de", "monster.fr", "monster.ie", "monster.nl", "monster.es", "monster.it", "monster.be",
+    "monster.at", "monster.ch", "monster.lu",
+    "ziprecruiter.co.uk", "ziprecruiter.ca",
+    "adzuna.co.uk", "adzuna.ca", "adzuna.com.au", "adzuna.de", "adzuna.fr", "adzuna.in", "adzuna.nl", "adzuna.it", "adzuna.es", "adzuna.pl",
+    "adzuna.at", "adzuna.ch", "adzuna.com.br", "adzuna.co.za", "adzuna.sg", "adzuna.co.nz", "adzuna.com.mx", "adzuna.be",
+    "careerbuilder.ca", "careerbuilder.co.uk", "simplyhired.ca", "simplyhired.co.uk", "simplyhired.com.au",
+    "seek.com.au", "seek.co.nz", "reed.co.uk", "totaljobs.com", "cv-library.co.uk", "naukri.com", "stepstone.de", "xing.com",
+    "workopolis.com", "jobstreet.com", "jobsdb.com",
 ]
  
  
