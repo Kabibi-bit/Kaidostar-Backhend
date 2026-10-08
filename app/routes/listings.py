@@ -326,7 +326,6 @@ async def trigger_scan(user_id: str, db: Session = Depends(get_db), _auth: dict 
     import anthropic
     import uuid as uuid_module
     from app.services.scheduler import run_scan_for_user, _pull_and_store_new_listings
-    from app.services.auto_apply import auto_apply_and_outreach_for_user
  
     try:
         uuid_module.UUID(user_id)
@@ -358,31 +357,23 @@ async def trigger_scan(user_id: str, db: Session = Depends(get_db), _auth: dict 
         auto_applied = []
         auto_drafted_outreach = []
         client = get_client()
-        if profile and profile.auto_apply_enabled and client is not None:
-            if getattr(profile, "is_athlete", False):
+        if profile and profile.auto_apply_enabled:
+            if getattr(profile, "is_athlete", False) and client is not None:
+                from app.services.auto_apply import auto_apply_and_outreach_for_user
                 from app.services.feed_common import not_feed
                 listings = db.query(Listing).filter(not_feed(Listing)).all()
                 from app.models.db_models import DismissedListing
                 dismissed_ids = {str(row.listing_id) for row in db.query(DismissedListing).filter(DismissedListing.user_id == user_id).all()}
                 ranked = rank_listings([_listing_to_dict(l) for l in listings], _profile_to_dict(profile), top_n=10, dismissed_ids=dismissed_ids)
-            else:
-                # Same as the nightly scan: Auto acts on the user's own Job Search v2
-                # matches (their honest fit, their dealbreakers) - or not at all.
-                try:
-                    from app.services.job_search import auto_candidates
-                    ranked = auto_candidates(db, user_id, profile)
-                except Exception as e:
-                    db.rollback()
-                    _log.warning("v2 auto candidates failed for %s: %s", user_id, e)
-                    ranked = []
-            # Same shared autonomous pass as the nightly scheduler: it enforces the
-            # user's own acceptance rules + daily cap (the set the Auto page previews)
-            # so a manual "scan now" applies to exactly what the engine would apply to
-            # unattended - never bypassing the rules, which matters most once consent
-            # has removed the undo window. Each listing is isolated inside the helper.
-            summary = auto_apply_and_outreach_for_user(db, client, user_id, profile, ranked)
-            auto_applied = summary["applied"]
-            auto_drafted_outreach = summary["outreach"]
+                summary = auto_apply_and_outreach_for_user(db, client, user_id, profile, ranked)
+                auto_applied = summary["applied"]
+                auto_drafted_outreach = summary["outreach"]
+            elif not getattr(profile, "is_athlete", False):
+                # The same Auto pass the schedule runs (and the Auto page's "Run now"): the person's
+                # own rules, caps and answer bank - what the Auto page previews, nothing else.
+                from app.services.auto_runner import run_pass
+                summary = run_pass(db, client, user_id, reason="scan")
+                auto_applied = [q for q in ((summary.get("plan") or {}).get("queued") or [])]
         result["auto_applied"] = auto_applied
         result["auto_drafted_outreach"] = auto_drafted_outreach
         return result
