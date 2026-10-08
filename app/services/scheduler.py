@@ -649,72 +649,15 @@ def run_scan_for_all_users():
                     .filter(Profile.user_id == user.id, Profile.is_current == True)  # noqa: E712
                     .first()
                 )
-                if profile and profile.auto_apply_enabled:
-                    # Auto acts on the user's own Job Search v2 matches: the same honest
-                    # fit they see on each card, and every Job Search dealbreaker they set
-                    # (hidden companies, sponsorship conflicts, pay floors on Hide...) binds
-                    # Auto too. If v2 can't run, Auto does nothing this cycle rather than
-                    # fall back to a different scoring scale.
-                    if getattr(profile, "is_athlete", False):
-                        # athletes' listings (athletic programs, coaching jobs) aren't in the
-                        # Job Search pool - they keep the athletics ranking they always had
-                        from app.models.db_models import DismissedListing
-                        dismissed_ids = {str(row.listing_id) for row in db.query(DismissedListing).filter(DismissedListing.user_id == user.id).all()}
-                        ranked = rank_listings(all_listing_dicts_this_cycle, _profile_to_dict(profile), top_n=10, dismissed_ids=dismissed_ids)
-                    else:
-                        try:
-                            from app.services.job_search import auto_candidates
-                            ranked = auto_candidates(db, str(user.id), profile, rows=v2_pool_this_cycle) if v2_pool_this_cycle is not None else []
-                        except Exception as e:
-                            db.rollback()
-                            print(f"    Auto skipped for {user.email}: v2 matching failed ({e})")
-                            ranked = []
- 
-                    # ONE shared autonomous pass - the same helper the manual /scan
-                    # endpoint uses, so the two can't drift. It enforces the user's
-                    # OWN acceptance rules (company always/never/boost, type, keywords,
-                    # signal strength, ghost risk, salary floor, deadline window,
-                    # remote-only) - the SAME logic the Auto page previews, so "what
-                    # you see" equals "what it does". Essential once autonomous consent
-                    # removes the undo window: the engine submits exactly the previewed
-                    # set, nothing else. The daily cap is the user's choice
-                    # (0 = unlimited, fully hands-off), not a forced rail.
+                # Auto runs on its own tick (auto_runner.run_tick: twice-daily passes per person, sends
+                # within minutes of their undo window, follow-up reminders). Athletes keep the athletics
+                # Auto they always had (their listings aren't in the Job Search pool).
+                if profile and profile.auto_apply_enabled and getattr(profile, "is_athlete", False):
+                    from app.models.db_models import DismissedListing
+                    dismissed_ids = {str(row.listing_id) for row in db.query(DismissedListing).filter(DismissedListing.user_id == user.id).all()}
+                    ranked = rank_listings(all_listing_dicts_this_cycle, _profile_to_dict(profile), top_n=10, dismissed_ids=dismissed_ids)
                     summary = auto_apply_and_outreach_for_user(db, anthropic_client, str(user.id), profile, ranked)
-                    auto_count = len(summary["applied"])
-                    outreach_count = len(summary["outreach"])
-                    print(f"    Auto Apply: {auto_count} approved "
-                          f"(of {summary['ranked_count']} ranked; {summary['filtered_count']} filtered by rules, "
-                          f"{summary['capped_out']} held past daily cap) for {user.email}")
-                    print(f"    Auto Outreach: {outreach_count} new outreach draft(s) queued for {user.email}")
-                    # Closes a real, confirmed gap: notifications.py's own
-                    # docstring already claimed the scheduler "would call
-                    # this directly," but it never actually did - meaning
-                    # a person's Inbox page had nothing real to show for
-                    # the one job that's supposed to work even when
-                    # nobody's watching. Wrapped in its own try/except so
-                    # a genuine notification-write failure can never
-                    # retroactively undo the real scan work above it.
-                    try:
-                        auto_apply_muted = ((profile.notification_preferences or {}) if profile else {}).get("auto_apply", True) is False
-                        if auto_count > 0 and not auto_apply_muted:
-                            db.add(Notification(
-                                user_id=user.id, type="auto_apply",
-                                title=f"Auto Apply: {auto_count} new application{'s' if auto_count != 1 else ''} auto-approved",
-                            ))
-                        if outreach_count > 0 and not auto_apply_muted:
-                            db.add(Notification(
-                                user_id=user.id, type="auto_apply",
-                                title=f"Auto Apply: {outreach_count} outreach email{'s' if outreach_count != 1 else ''} drafted",
-                                detail="Review and send from the Workshop whenever you're ready.",
-                            ))
-                        if auto_count > 0 or outreach_count > 0:
-                            db.commit()
-                    except Exception as e:
-                        # Roll back the failed notification write so it can't leave the
-                        # session dirty for the digest step / next user (the auto-apply
-                        # work above was already committed inside create_application_for_match).
-                        db.rollback()
-                        print(f"    Notification write failed (non-fatal): {e}")
+                    print(f"    Athlete Auto: {len(summary['applied'])} approved, {len(summary['outreach'])} outreach drafted for {user.email}")
  
                 # Saved-search alerts (Job Search v2): new strong matches for any saved
                 # search with alerts on go to the Inbox - once per job, shared with the
@@ -766,134 +709,13 @@ def run_scan_for_all_users():
                 print(f"  Scan failed for {user.email}, continuing with remaining users: {e}")
         print("Daily scan complete.")
  
-        # Closes a real gap: neither this scheduled job nor the manual
-        # UI ever automatically sent an approved application once its
-        # undo window passed - only drafting and approval were ever
-        # automatic, directly contradicting this function's own claim
-        # of full autonomy ("fires even if nobody opens the app that
-        # day"). An application could sit "approved" forever if nobody
-        # came back to manually click send. Mirrors the exact logic
-        # already proven in the manual /applications/{id}/send route,
-        # applied in bulk here rather than requiring one explicit call
-        # per application. Isolated in its own try/except so a real
-        # failure here can never retroactively undo the scan above.
+        # Auto right after the day's new listings: sends that are due, follow-ups, and a pass for
+        # everyone whose last one is old enough (the same tick that runs every AUTO_TICK_MINUTES).
         try:
-            from app.models.db_models import Application   # (Listing: this module's own import - see above)
-            # Deliver via the SAME real path as the manual /send route. Previously
-            # this loop just flipped status to "sent" in bulk WITHOUT delivering
-            # anything - no email, no submission - fabricating a "sent" for
-            # applications that were never actually sent to any employer. That
-            # violated the whole delivery system's honesty guarantee. Now each due
-            # application goes through deliver_accepted_application: Metis picks the
-            # channel and either really emails it or auto-submits/hands it off, and
-            # it is marked "sent" ONLY on a real send (email or a confirmed web
-            # auto-submit). Web hand-offs become ready_to_submit for the user.
-            from app.routes.applications import deliver_accepted_application
-            now = utcnow()
-            due_to_send = (
-                db.query(Application)
-                .filter(Application.status == "approved", Application.sendable_at.isnot(None), Application.sendable_at <= now)
-                .all()
-            )
-            sent_counts_by_user = {}
-            handoff_counts_by_user = {}
-            closed_counts_by_user = {}
-            stale_counts_by_user = {}
-            # An approval that came due long ago and was never sent (this scan was down for a while) is not
-            # sent blind now: the posting may be gone and the person may have moved on. It goes back to
-            # "needs review" - one click re-approves it - and they're told. Normal approvals come due within
-            # the day (the undo window, or none with autonomous consent), so this never touches them.
-            from datetime import timedelta as _td
-            from app.services.timeutil import to_naive_utc as _naive
-            _stale_before = now - _td(days=AUTO_SEND_MAX_AGE_DAYS)
-            for app_record in due_to_send:
-                # Per-application isolation: one failed delivery must not abort the
-                # rest of the batch (matches this file's design elsewhere).
-                try:
-                    # Re-read the current status before delivering. Between the bulk
-                    # query above and here, the user may have sent this application
-                    # manually (or undone it) in another request; the app_record we
-                    # hold would still say "approved". Delivering on that stale value
-                    # would send the SAME application twice - a real double
-                    # application to the employer. Refresh and skip unless it's still
-                    # an un-handled approved application.
-                    db.refresh(app_record)
-                    if app_record.status != "approved":
-                        continue
-                    _due = _naive(app_record.sendable_at)
-                    if _due is not None and _due < _stale_before:
-                        app_record.status = "pending_review"
-                        app_record.sendable_at = None
-                        db.commit()
-                        stale_counts_by_user[app_record.user_id] = stale_counts_by_user.get(app_record.user_id, 0) + 1
-                        continue
-                    listing = db.query(Listing).filter(Listing.id == app_record.listing_id).first()
-                    if not listing:
-                        continue
-                    # (a job from an employer's career site that Kaidostar can no longer vouch for as
-                    # open is never sent - deliver_accepted_application hands it back instead)
-                    res = deliver_accepted_application(db, app_record, listing, anthropic_client, unattended=True)
-                    uid = app_record.user_id
-                    if res.get("status") == "sent":
-                        sent_counts_by_user[uid] = sent_counts_by_user.get(uid, 0) + 1
-                    elif res.get("posting_closed"):
-                        closed_counts_by_user[uid] = closed_counts_by_user.get(uid, 0) + 1
-                    elif res.get("status") == "ready_to_submit":
-                        handoff_counts_by_user[uid] = handoff_counts_by_user.get(uid, 0) + 1
-                except Exception as _send_err:
-                    db.rollback()
-                    print(f"    Auto-send skipped for application {getattr(app_record, 'id', '?')}: {_send_err}")
-            sent_count = sum(sent_counts_by_user.values())
-            if sent_counts_by_user or handoff_counts_by_user or closed_counts_by_user or stale_counts_by_user:
-                # Notify each affected user with their own genuine counts: what was
-                # actually sent, and what is now waiting for them to submit (honest -
-                # a web hand-off is NOT a send). Respect the auto_apply mute.
-                # (Profile is this module's own import: re-importing it here made it a local name for the
-                # whole function, so the scan's very first `join(Profile)` raised UnboundLocalError and
-                # every daily scan stopped there - no rescoring, Auto, alerts, digests or auto-send.)
-                affected = set(sent_counts_by_user) | set(handoff_counts_by_user) | set(closed_counts_by_user) | set(stale_counts_by_user)
-                profiles = db.query(Profile).filter(Profile.user_id.in_(list(affected)), Profile.is_current == True).all()  # noqa: E712
-                prefs_by_user = {p.user_id: (p.notification_preferences or {}) for p in profiles}
-                for uid in affected:
-                    if prefs_by_user.get(uid, {}).get("auto_apply", True) is False:
-                        continue
-                    sc = sent_counts_by_user.get(uid, 0)
-                    hc = handoff_counts_by_user.get(uid, 0)
-                    if sc > 0:
-                        db.add(Notification(
-                            user_id=uid, type="auto_apply",
-                            title=f"Auto-send: {sc} approved application{'s' if sc != 1 else ''} past your undo window, now sent",
-                        ))
-                    if hc > 0:
-                        db.add(Notification(
-                            user_id=uid, type="auto_apply",
-                            title=f"{hc} application{'s' if hc != 1 else ''} ready for you to submit",
-                            detail="These couldn't be sent automatically (the posting needs you to submit it). Open the Workshop to finish them.",
-                        ))
-                    oc = stale_counts_by_user.get(uid, 0)
-                    if oc > 0:
-                        db.add(Notification(
-                            user_id=uid, type="auto_apply",
-                            title=f"{oc} approved application{'s' if oc != 1 else ''} need{'' if oc != 1 else 's'} your OK again before sending",
-                            detail=(f"{'They were' if oc != 1 else 'It was'} approved more than {AUTO_SEND_MAX_AGE_DAYS} days ago and never sent, so Kaidostar "
-                                    "didn't send " + ("them" if oc != 1 else "it") + " now. Check the posting is still open, then approve in the Workshop to send."),
-                        ))
-                    cc = closed_counts_by_user.get(uid, 0)
-                    if cc > 0:
-                        db.add(Notification(
-                            user_id=uid, type="auto_apply",
-                            title=f"{cc} approved application{'s' if cc != 1 else ''} not sent: the job may have closed",
-                            detail=("Kaidostar can no longer confirm " + ("these jobs are" if cc != 1 else "this job is") + " still open on the employer's site, "
-                                    "so nothing was sent. If a posting is still up, you can submit your application there from the Workshop."),
-                        ))
-                db.commit()
-                print(f"Auto-send: {sent_count} application(s) genuinely sent; {sum(handoff_counts_by_user.values())} handed off for manual submission; "
-                      f"{sum(closed_counts_by_user.values())} not sent because the job may have closed; "
-                      f"{sum(stale_counts_by_user.values())} approved long ago sent back for review.")
+            from app.services.auto_runner import run_tick
+            print(f"Auto tick after the scan: {run_tick()}")
         except Exception as e:
-            # Roll back so the session is clean for the finally that closes it.
-            db.rollback()
-            print(f"Auto-send failed (non-fatal): {e}")
+            print(f"Auto tick after the scan failed (non-fatal): {e}")
     except Exception as e:
         print(f"Scan failed: {e}")
     finally:
@@ -920,6 +742,27 @@ def start_scheduler():
     # (On a plan that sleeps when idle, /feeds/tick called by a free pinger keeps both going.)
     feed_minutes = max(5, int(os.getenv("FEED_TICK_MINUTES", "10")))
     scheduler.add_job(_feed_tick_job, "interval", minutes=feed_minutes, max_instances=1, coalesce=True)
+    # Auto: sends approved applications soon after their undo window, follow-up reminders, and each
+    # person's twice-daily pass. First run a few minutes after start-up, so a restart (a free plan
+    # sleeps) never leaves due applications waiting a whole interval.
+    try:
+        from datetime import timedelta as _td
+        from app.services.auto_runner import TICK_MINUTES
+        scheduler.add_job(_auto_tick_job, "interval", minutes=TICK_MINUTES, max_instances=1, coalesce=True,
+                          next_run_time=datetime.now() + _td(minutes=3))
+    except Exception as e:
+        print(f"Auto tick not scheduled (non-fatal): {e}")
     scheduler.start()
     return scheduler
+ 
+ 
+def _auto_tick_job():
+    """One Auto tick (see auto_runner.run_tick). Never raises."""
+    try:
+        from app.services.auto_runner import run_tick
+        res = run_tick()
+        if res.get("passes") or res.get("delivered") or res.get("recovered"):
+            print(f"Auto tick: {res}")
+    except Exception as e:
+        print(f"Auto tick failed (non-fatal): {e}")
  
