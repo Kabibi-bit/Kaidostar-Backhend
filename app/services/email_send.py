@@ -54,13 +54,19 @@ def guess_contact_emails(org_name: str) -> dict:
     }
  
  
-def send_email(to_address: str, subject: str, body: str, html_body: str | None = None) -> dict:
+def send_email(to_address: str, subject: str, body: str, html_body: str | None = None,
+               reply_to: str | None = None, attachments: list | None = None) -> dict:
     """Actually sends an email via Resend. Raises a clear error if
     RESEND_API_KEY isn't configured, rather than silently no-op'ing.
     html_body is optional - every existing caller keeps working
     exactly as before with plain text only; passing it adds a real,
     properly-formatted HTML version alongside the text one, which
     Resend's own API already supports in the same request.
+ 
+    reply_to (optional): where replies go - for an application sent on a
+    person's behalf, their own address, so the employer answers them.
+    attachments (optional): [{"filename": str, "content": base64 str}],
+    e.g. their resume. At most 3 files, each under 5 MB.
     """
     # Recipient sanity check, centralized here so every send path is
     # covered at once. Blocks a missing/blank address, control
@@ -88,8 +94,25 @@ def send_email(to_address: str, subject: str, body: str, html_body: str | None =
     }
     if html_body:
         payload["html"] = html_body
+    if reply_to:
+        reply_to = str(reply_to).strip()
+        if any(ch in reply_to for ch in ["\n", "\r", ",", ";", " "]) or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", reply_to):
+            raise ValueError("Reply-to must be a single, valid email address.")
+        payload["reply_to"] = reply_to
+    if attachments:
+        files = []
+        for a in attachments[:3]:
+            name = str((a or {}).get("filename") or "").strip()
+            content = (a or {}).get("content")
+            if not name or not isinstance(content, str) or len(content) > 7_000_000 or any(ch in name for ch in "\r\n/\\"):
+                raise ValueError("Each attachment needs a plain file name and base64 content under 5 MB.")
+            files.append({"filename": name[:120], "content": content})
+        payload["attachments"] = files
     headers = {"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"}
     resp = httpx.post(RESEND_API_URL, json=payload, headers=headers, timeout=15)
     resp.raise_for_status()
-    return resp.json()
+    try:
+        return resp.json()
+    except ValueError:
+        return {}   # accepted (the provider said 2xx) - its reply just had no readable id
  
