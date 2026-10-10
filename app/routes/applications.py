@@ -304,11 +304,12 @@ def list_applications(user_id: str, db: Session = Depends(get_db), _auth: dict =
     closed = closed_by_listing(db, [l for a, l in rows if a.status == "ready_to_submit"])
     # Auto's packages: why a hand-off happened (and whether it may already have gone through)
     try:
-        from app.services.auto_runner import packages_for
+        from app.services.auto_runner import packages_for, load_autopilot
         pkgs = packages_for(db, user_id)
+        apst = load_autopilot(db, user_id)
     except Exception:
         db.rollback()
-        pkgs = {}
+        pkgs, apst = {}, {}
  
     def _route(url):
         try:
@@ -330,6 +331,16 @@ def list_applications(user_id: str, db: Session = Depends(get_db), _auth: dict =
                 out["send_reasoning"] = str(ho.get("why") or "")[:400]
                 if ho.get("possiblySent"):
                     out["auto_submit_possibly_sent"] = True
+                if ho.get("autopilot"):
+                    # handed to Autopilot: said only while it will take it (on, and not too long ago)
+                    try:
+                        from app.services.auto_runner import autopilot_will_take
+                        takes = autopilot_will_take(apst, pkg, out["apply_route"])
+                    except Exception:
+                        takes = False
+                    out["autopilot_takes"] = bool(takes)
+                    if not takes:
+                        out["send_reasoning"] = "Ready for one click: open it with the Kaidostar Apply extension (it fills the form in your browser), or submit it at the posting."
         c = closed.get(str(l.id)) if a.status == "ready_to_submit" else None
         if c is not None:
             # a standing heads-up, not a cause: the hand-off may have happened earlier for another reason
@@ -519,7 +530,7 @@ def _package_sent(db, app_record, proof):
  
  
 @router.get("/{application_id}/autofill")
-def application_autofill_data(application_id: str, db: Session = Depends(get_db), authorization: str = Header(None)):
+def application_autofill_data(application_id: str, autopilot: bool = False, lease: str | None = None, db: Session = Depends(get_db), authorization: str = Header(None)):
     """The data the Kaidostar browser extension needs to fill THIS application's
     form in the user's own browser - their real logged-in session and residential
     IP, which is what actually reaches login-gated ATSes and avoids the bot-block a
@@ -535,6 +546,10 @@ def application_autofill_data(application_id: str, db: Session = Depends(get_db)
     so it is deliberately not metered against the auto-submit cap - the Pro+consent
     gate is the control. Never invents applicant data; empty fields stay empty and
     the extension's safety guards hand off any form it can't fill honestly.
+ 
+    autopilot (+ lease): the extension's Autopilot is opening it, to apply on its own - only one this browser was given
+    (its lease token, from POST /auto/{user_id}/autopilot) and hasn't lost. Without it, you're opening it yourself:
+    it's yours from then on (Autopilot never takes it, and stops applying to it if it was).
     """
     from app.models.db_models import Listing, ResumeEntry
     import uuid as uuid_module
@@ -567,6 +582,20 @@ def application_autofill_data(application_id: str, db: Session = Depends(get_db)
     ho0 = pkg0.get("handoff") if isinstance(pkg0.get("handoff"), dict) else {}
     if ho0.get("possiblySent"):
         raise HTTPException(status_code=409, detail="This application may already have gone through - check the posting (or your email). If it didn't, choose “It didn’t go through” on the Auto page, then open it again.")
+    if autopilot:
+        # Autopilot opens only one this browser was given, and still has (you didn't open it yourself meanwhile, its time
+        # isn't up)
+        if not (app_record.status == "ready_to_submit" and ho0.get("key") == "extension" and AR.autopilot_lease_held(pkg0, token=lease or "")):
+            raise HTTPException(status_code=409, detail="Autopilot isn't applying to this one any more - it was opened elsewhere, or its turn ran out.")
+    elif app_record.status == "ready_to_submit":
+        # you're opening it yourself: it's yours - Autopilot never takes it (and stops if it was applying to it)
+        try:
+            pkg1 = AR.load_package(db, app_record.user_id, app_record.id, locked=True)
+            if AR.autopilot_take_over(pkg1):
+                AR.save_package(db, app_record.user_id, app_record.id, pkg1)
+            db.commit()
+        except Exception:
+            db.rollback()
  
     if app_record.status == "approved":
         # you're submitting it in your browser now: the unattended send must not also deliver it
@@ -578,11 +607,13 @@ def application_autofill_data(application_id: str, db: Session = Depends(get_db)
         app_record.status = "ready_to_submit"
         try:
             from app.services import auto_runner as AR
-            pkg = AR.load_package(db, app_record.user_id, app_record.id)
+            pkg = AR.load_package(db, app_record.user_id, app_record.id, locked=True)
             if pkg is not None:
-                pkg["handoff"] = {"key": "extension_opened", "why": "Opened in the Kaidostar Apply extension - finish it there, or at the posting.", "possiblySent": False}
+                AR.autopilot_release(pkg)
+                pkg["handoff"] = {"key": "extension_opened", "why": "Opened in the Kaidostar Apply extension - finish it there, or at the posting.", "possiblySent": False,
+                                  "at": AR._now_ms()}
                 AR.save_package(db, app_record.user_id, app_record.id, pkg)
-                db.commit()
+            db.commit()
         except Exception:
             db.rollback()
  
@@ -624,7 +655,17 @@ def application_autofill_data(application_id: str, db: Session = Depends(get_db)
         "board_domains": _board_domains(),
         # the extension tells Kaidostar right before it clicks submit, so a result it never sees isn't retried
         "attempt_url": f"/applications/{app_record.id}/submit-attempt",
+        # the application form's own page, on hiring systems that keep it apart from the job's page ("" otherwise)
+        "form_url": _form_url(listing.apply_url),
     }
+ 
+ 
+def _form_url(apply_url) -> str:
+    try:
+        from app.services import auto_runner as AR
+        return AR.application_form_url(apply_url)
+    except Exception:
+        return ""
  
  
 def _ats_domains() -> list:
@@ -643,12 +684,19 @@ def _board_domains() -> list:
         return []
  
  
+AUTOPILOT_NOT_ITS = ("Autopilot no longer holds this application - it was opened elsewhere, approved again, or its turn ran out - "
+                     "so it doesn't submit it.")
+ 
+ 
 @router.post("/{application_id}/submit-attempt")
-def application_submit_attempt(application_id: str, db: Session = Depends(get_db), authorization: str = Header(None)):
-    """The extension calls this right BEFORE it clicks the form's submit button. If it then never sees the
-    result (the page moved on, the tab closed, the browser crashed), the application is already marked "may
-    have gone through": Kaidostar won't open it again for you, and tells you to check before resubmitting.
-    A confirmed submission afterwards records it as sent, as usual. Same Pro + consent gate as autofill."""
+def application_submit_attempt(application_id: str, own: bool = False, autopilot: bool = False, lease: str | None = None, db: Session = Depends(get_db),
+                               authorization: str = Header(None)):
+    """The extension calls this right BEFORE it clicks the form's submit button - or as you submit the form yourself
+    (own). If it then never sees the result (the page moved on, the tab closed, the browser crashed), the application is
+    already marked "may have gone through": Kaidostar won't open it again for you, and tells you to check before
+    resubmitting. A confirmed submission afterwards records it as sent, as usual. Same Pro + consent gate as autofill.
+    autopilot (+ lease): Autopilot's own click, applying on its own - only while the application is still this browser's
+    (you didn't open it yourself, or approve it again, meanwhile): otherwise it's refused, and nothing is clicked."""
     from app.models.db_models import Listing
     from app.services import auto_runner as AR
     import uuid as uuid_module
@@ -665,6 +713,13 @@ def application_submit_attempt(application_id: str, db: Session = Depends(get_db
         raise HTTPException(status_code=409, detail="This application was already sent.")
     if app_record.status not in ("approved", "ready_to_submit"):
         raise HTTPException(status_code=400, detail="Approve this application first.")
+    by_autopilot = autopilot and not own
+    if by_autopilot:
+        # Autopilot's click: checked before anything changes - only one this browser holds, still waiting to be submitted
+        pk0 = AR.load_package(db, app_record.user_id, app_record.id) or {}
+        ho0 = pk0.get("handoff") if isinstance(pk0.get("handoff"), dict) else {}
+        if app_record.status != "ready_to_submit" or ho0.get("key") != "extension" or not AR.autopilot_lease_held(pk0, token=lease or ""):
+            raise HTTPException(status_code=409, detail=AUTOPILOT_NOT_ITS)
     if app_record.status == "approved":
         # submitting in your browser now: the unattended send must not also deliver it
         n = (db.query(Application).filter(Application.id == app_record.id, Application.status == "approved")
@@ -674,13 +729,24 @@ def application_submit_attempt(application_id: str, db: Session = Depends(get_db
             raise HTTPException(status_code=409, detail="Kaidostar is sending this application right now.")
         app_record.status = "ready_to_submit"
     listing = db.query(Listing).filter(Listing.id == app_record.listing_id).first()
-    pkg = AR.load_package(db, app_record.user_id, app_record.id) or AR._manual_pkg(app_record, listing)
+    pkg = AR.load_package(db, app_record.user_id, app_record.id, locked=True) or AR._manual_pkg(app_record, listing)
     ho = pkg.get("handoff") if isinstance(pkg.get("handoff"), dict) else {}
+    if by_autopilot and not (ho.get("key") == "extension" and AR.autopilot_lease_held(pkg, token=lease or "")):
+        db.rollback()
+        raise HTTPException(status_code=409, detail=AUTOPILOT_NOT_ITS)
     if ho.get("possiblySent"):
+        if own is True:
+            # you submitted it again yourself (after one whose result wasn't seen): it stays "may have gone through" -
+            # noted, never refused (your click has already happened)
+            AR._attempt(pkg, "web_ext", "clicked", "Submitted again on the page, by you - waiting for the page to confirm it")
+            AR.save_package(db, app_record.user_id, app_record.id, pkg)
+            db.commit()
+            return {"ok": True, "again": True}
         # one submit whose result nobody saw is enough: a second (another tab, a second run) could send it twice
         raise HTTPException(status_code=409, detail="This application may already have gone through - check the posting (or your email). If it didn't, choose “It didn’t go through” first.")
-    AR._attempt(pkg, "web_ext", "clicked", "Submit clicked in the Kaidostar Apply extension - waiting for the page to confirm it")
-    pkg["handoff"] = {"key": "extension_clicked", "possiblySent": True,
+    AR._attempt(pkg, "web_ext", "clicked", ("Submit clicked by Kaidostar Apply's Autopilot" if by_autopilot else "Submit clicked in the Kaidostar Apply extension")
+                + " - waiting for the page to confirm it")
+    pkg["handoff"] = {"key": "extension_clicked", "possiblySent": True, "at": AR._now_ms(),
                       "why": "Submitted from the Kaidostar Apply extension, but its confirmation wasn't seen - check the posting (or your email) before submitting again."}
     AR.save_package(db, app_record.user_id, app_record.id, pkg)
     db.commit()
@@ -688,9 +754,11 @@ def application_submit_attempt(application_id: str, db: Session = Depends(get_db
  
  
 @router.post("/{application_id}/not-sent")
-def application_not_sent(application_id: str, db: Session = Depends(get_db), authorization: str = Header(None)):
+def application_not_sent(application_id: str, took_back: bool = False, db: Session = Depends(get_db), authorization: str = Header(None)):
     """You checked: an application Kaidostar flagged as "may have gone through" did not. The flag is cleared,
-    so you (or the extension) can submit it again. Only you can say this - Kaidostar never clears it itself."""
+    so you (or the extension) can submit it again. Only you can say this - Kaidostar never clears it for a submit that
+    was clicked. took_back: the extension taking back its own note because it never clicked (you closed its panel
+    while it was about to, or the form's button couldn't be pressed)."""
     from app.services import auto_runner as AR
     import uuid as uuid_module
     try:
@@ -704,14 +772,19 @@ def application_not_sent(application_id: str, db: Session = Depends(get_db), aut
     if app_record.status != "ready_to_submit":
         raise HTTPException(status_code=409 if app_record.status in ("sent", "sending") else 400,
                             detail="This application was already sent." if app_record.status in ("sent", "sending") else "This application isn't waiting to be submitted.")
-    pkg = AR.load_package(db, app_record.user_id, app_record.id)
+    pkg = AR.load_package(db, app_record.user_id, app_record.id, locked=True)
     ho = pkg.get("handoff") if isinstance(pkg, dict) and isinstance(pkg.get("handoff"), dict) else None
     if ho and ho.get("possiblySent"):
         ho["possiblySent"] = False
-        ho["why"] = "You checked - it didn't go through. Ready for you to submit."
-        AR._attempt(pkg, "check", "not_sent", "You said it didn't go through")
+        ho["at"] = AR._now_ms()
+        if took_back:
+            ho["why"] = "Kaidostar Apply didn't click submit after all - ready for you to submit."
+            AR._attempt(pkg, "check", "not_sent", "Kaidostar Apply took back its note: it never clicked submit")
+        else:
+            ho["why"] = "You checked - it didn't go through. Ready for you to submit."
+            AR._attempt(pkg, "check", "not_sent", "You said it didn't go through")
         AR.save_package(db, app_record.user_id, app_record.id, pkg)
-        db.commit()
+    db.commit()
     return {"ok": True}
  
  
@@ -915,12 +988,27 @@ def application_cover_letter(application_id: str, db: Session = Depends(get_db),
  
 class QuestionsIn(BaseModel):
     questions: list = Field(default_factory=list, max_length=80)
+    page: dict | None = None      # the job page's own structured data (schema.org JobPosting), as the extension read it
+ 
+ 
+def _clean_page(page):
+    """What the extension read from the job page's structured data, bounded and typed - or None."""
+    if not isinstance(page, dict):
+        return None
+    def strs(v):
+        return [str(x)[:120] for x in (v if isinstance(v, list) else [])[:20] if isinstance(x, str) and x.strip()]
+    n = page.get("n")
+    return {"n": n if isinstance(n, int) and 0 <= n <= 50 else 0, "title": str(page.get("title") or "")[:200],
+            "countries": strs(page.get("countries")), "regions": strs(page.get("regions")), "localities": strs(page.get("localities")),
+            "remote": strs(page.get("remote")), "telecommute": page.get("telecommute") is True}
  
  
 @router.post("/{application_id}/answers")
 def application_answers(application_id: str, payload: QuestionsIn, db: Session = Depends(get_db), authorization: str = Header(None)):
     """The extension sends the questions on an application form; this answers the ones the person's
-    own answer bank covers - and says, for the rest, why it won't. Same Pro + consent gate as autofill."""
+    own answer bank covers - and says, for the rest, why it won't. The rules first; a question they don't
+    recognise is read by AI from its own words (never the person's answers) and answered only when two
+    readings agree (auto_runner.answer_form). Same Pro + consent gate as autofill."""
     import uuid as uuid_module
     try:
         uuid_module.UUID(application_id)
@@ -945,7 +1033,84 @@ def application_answers(application_id: str, payload: QuestionsIn, db: Session =
                    # an answer the form picked by itself (no "Select..." placeholder, a pre-checked radio)
                    "preset": bool(q.get("preset")), "current": str(q.get("current") or "")[:200]})
     listing = db.query(Listing).filter(Listing.id == app_record.listing_id).first()
-    return {"answers": AA.resolve_all(qs, AR.load_answers(db, app_record.user_id), AR.job_country_of(db, listing))}
+    client = get_client()
+    if client is not None:
+        # AI reading is metered per person per day; past the limit a form is answered by the rules alone (never refused)
+        from app.services.rate_limit import rate_limit
+        from app.services.question_reader import DAILY_READS
+        try:
+            rate_limit(db, str(app_record.user_id), "question-reading", limit_per_day=DAILY_READS)
+        except HTTPException:
+            client = None
+    try:
+        answers = AR.answer_form(db, app_record.user_id, listing, qs, _clean_page(payload.page), client, metered=True)
+    except Exception as e:
+        _log.info("Answering with readings failed - %s", e)
+        db.rollback()
+        answers = AR.withhold_learned(AA.resolve_all(qs, AR.load_answers(db, app_record.user_id), AR.job_country_of(db, listing),
+                                                     None, getattr(listing, "org", None)), qs, db)
+    return {"answers": answers}
+ 
+ 
+class LearnIn(BaseModel):
+    answers: list = Field(default_factory=list, max_length=40)   # [{label, type, options, answer}] the person gave on the form
+    page: dict | None = None                                     # the job page's structured data (pageJob), for the job's country
+ 
+ 
+@router.post("/{application_id}/learn-answers")
+def application_learn_answers(application_id: str, payload: LearnIn, db: Session = Depends(get_db), authorization: str = Header(None)):
+    """The person answered some of a form's questions on the page themselves and asked Kaidostar to remember them:
+    each is saved to their answer bank, for that same question, word for word (never a question Kaidostar doesn't
+    answer for anyone, a voluntary equal-opportunity one, or a tick box). Same Pro + consent gate as autofill."""
+    import uuid as uuid_module
+    from app.models.db_models import Listing
+    try:
+        uuid_module.UUID(application_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Application not found")
+    app_record = db.query(Application).filter(Application.id == application_id).first()
+    if not app_record:
+        raise HTTPException(status_code=404, detail="Application not found")
+    verify_token_belongs_to_user(str(app_record.user_id), authorization)
+    _require_autosubmit_access(db, app_record)
+    from app.services import auto_answers as AA
+    from app.services import auto_runner as AR
+    listing = db.query(Listing).filter(Listing.id == app_record.listing_id).first()
+    bank = AR.load_answers(db, app_record.user_id)
+    given = [dict(g) for g in (payload.answers or [])[:40] if isinstance(g, dict)]
+    # what each question is: as the AI read it on the form - or, for one it hasn't read, read now (the question's own words
+    # only; counted with the form readings). A work-authorization, medical or voluntary question the rules' words miss is
+    # never remembered.
+    kinds = [None] * len(given)
+    try:
+        from app.services import question_reader as QR
+        qforms = [{"label": g.get("label"), "type": g.get("type"), "options": g.get("options")} for g in given]
+        kinds = [QR.cached_kind(q, db) for q in qforms]
+        client = get_client() if bank.get("ai", True) else None
+        if client is not None and any(k is None for k in kinds):
+            from app.services.rate_limit import rate_limit
+            try:
+                rate_limit(db, str(app_record.user_id), "question-reading", limit_per_day=QR.DAILY_READS)
+            except HTTPException:
+                client = None
+            if client is not None:
+                fresh = iter(QR.kinds_now([q for q, k in zip(qforms, kinds) if k is None], client, db))
+                kinds = [k if k is not None else next(fresh, None) for k in kinds]
+    except Exception:
+        pass
+    for g, k in zip(given, kinds):
+        g["read"] = k or ""
+    # (an answer is reused for jobs in the country of this one only - when that's known)
+    try:
+        country = AR.job_country_of(db, listing, _clean_page(payload.page))
+    except Exception:
+        db.rollback()
+        country = None
+    merged, saved, skipped = AA.learn(bank, given, org=(getattr(listing, "org", "") or ""), now_ms=AR._now_ms(), country=country)
+    if saved:
+        bank = AR.save_answers(db, app_record.user_id, merged)
+        db.commit()
+    return {"saved": saved, "skipped": skipped, "custom": len(bank.get("custom") or [])}
  
  
 class FollowUpIn(BaseModel):
