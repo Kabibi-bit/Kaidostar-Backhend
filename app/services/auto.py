@@ -10,6 +10,8 @@ PUT  /auto/{user_id}/answers   save the answer bank.
 POST /auto/{user_id}/run       run a pass now ("Run now").
 POST /auto/{user_id}/approve   approve prepared applications (each still gets the undo window).
 POST /auto/{user_id}/skip      discard prepared applications that haven't gone out.
+POST /auto/{user_id}/autopilot the Kaidostar Apply extension applying on its own: it reports what happened to the last
+                               application it took and gets the next one (see auto_runner.autopilot_step).
 """
 import json
 import uuid as uuid_module
@@ -73,6 +75,11 @@ def apps_payload(db, user_id) -> list:
     for o in db.query(Outcome).filter(Outcome.user_id == user_id).order_by(Outcome.updated_at.asc()).all():
         outcomes[str(o.listing_id)] = o.status
     pk = AR.packages_for(db, user_id)
+    try:
+        ap = AR.load_autopilot(db, user_id)
+    except Exception:
+        db.rollback()
+        ap = {}
  
     def iso(d):
         d = AR.to_naive_utc(d)
@@ -86,6 +93,7 @@ def apps_payload(db, user_id) -> list:
             "created_at": iso(a.created_at), "sendable_at": iso(a.sendable_at), "sent_at": iso(a.sent_at),
             "sent_channel": a.sent_channel, "sent_to_address": a.sent_to_address, "apply_url": l.apply_url,
             "apply_route": _route_of(AR, l.apply_url),
+            "autopilot_takes": bool(a.status == "ready_to_submit" and AR.autopilot_will_take(ap, pk.get(str(a.id)), _route_of(AR, l.apply_url))),
             "auto_generated": bool(a.auto_generated), "outcome_status": outcomes.get(str(a.listing_id)),
             "package": pk.get(str(a.id)),
         })
@@ -135,12 +143,22 @@ def get_state(user_id: str, refresh: bool = False, db: Session = Depends(get_db)
         "apps": apps_payload(db, user_id), "answers": bank, "coverage": AA.coverage(bank),
         "prefill": _job_search_prefill(db, user_id),
         "state": {"lastRunAt": last, "runs": (st.get("runs") or [])[-10:], "lastError": st.get("lastError"),
-                  "extensionSeenAt": st.get("extensionSeenAt")},
+                  "extensionSeenAt": st.get("extensionSeenAt"), "autopilot": _autopilot_status(db, user_id)},
         "server": {"browserAvailable": ctx["browserAvailable"], "emailReady": ctx["emailReady"],
                    "tickMinutes": AR.TICK_MINUTES, "passHours": AR.PASS_HOURS,
                    "nextPassAt": (last + AR.PASS_HOURS * 3600 * 1000) if last else None},
         "engineVersion": AE.VERSION, "now": ctx["now"],
     }
+ 
+ 
+def _autopilot_status(db, user_id) -> dict:
+    """When the extension's Autopilot last checked in, whether it's applying (and why not), and what its last run did."""
+    try:
+        from app.services import auto_runner as AR
+        return AR.autopilot_status(AR.load_autopilot(db, user_id))
+    except Exception:
+        db.rollback()
+        return {"seenAt": None, "live": False, "last": None}
  
  
 class SettingsIn(BaseModel):
@@ -184,11 +202,13 @@ def put_answers(user_id: str, payload: AnswersIn, db: Session = Depends(get_db),
     from app.services import auto_answers as AA
     from app.services import auto_runner as AR
     try:
-        if len(json.dumps(payload.answers)) > 30000:
+        # (up to 100 custom answers - ones saved from forms keep the form's whole question)
+        if len(json.dumps(payload.answers)) > 90000:
             raise HTTPException(status_code=400, detail="Those answers are too long.")
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Those answers aren't valid.")
-    bank = AR.save_answers(db, user_id, payload.answers)
+    # (answers the extension remembered since this page loaded the bank are kept)
+    bank = AR.save_answers(db, user_id, AR.merge_answers(AR.load_answers(db, user_id), payload.answers))
     db.commit()
     AR.invalidate(user_id)
     return {"answers": bank, "coverage": AA.coverage(bank)}
@@ -267,4 +287,31 @@ def skip(user_id: str, payload: IdsIn, db: Session = Depends(get_db), _auth: dic
     db.commit()
     AR.invalidate(user_id)
     return {"skipped": n}
+ 
+ 
+class AutopilotIn(BaseModel):
+    result: dict | None = None                          # {application_id, outcome, reason, step}: the last one it took
+    run: str | None = Field(default=None, max_length=40)  # the run this belongs to (each run ends in one summary)
+    more: bool = True                                   # False: only the result - the run is over, nothing more is taken
+    off: bool = False                                   # you turned Autopilot off (the run is over)
+    on: bool = True                                     # its switch in that browser (a step from one where it's off turns it off)
+ 
+ 
+@router.post("/{user_id}/autopilot")
+def autopilot(user_id: str, payload: AutopilotIn, db: Session = Depends(get_db), _auth: dict = Depends(require_auth_for_user)):
+    """Kaidostar Apply's Autopilot, applying for you in your own browser: it says what happened to the application it
+    took last, and gets the next one it may apply to on its own - one on an employer's hiring system that was approved
+    (by you, or by Auto after your undo window), never one that may already have gone through. The same Pro + consent
+    rules as every way Kaidostar submits; anything that needs you is left on the Auto page with the reason."""
+    _uuid(user_id)
+    try:
+        if payload.result is not None and len(json.dumps(payload.result)) > 4000:
+            raise HTTPException(status_code=400, detail="That result is too large.")
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="That result isn't valid.")
+    rate_limit(db, user_id, "autopilot", limit_per_day=400)
+    from app.services import auto_runner as AR
+    res = AR.autopilot_step(db, user_id, payload.result, payload.run, payload.more and not payload.off and payload.on, payload.off, payload.on)
+    AR.invalidate(user_id)
+    return res
  
